@@ -67,4 +67,38 @@ plus 7 [NSFW] scenarios.
 
 ```
 subject -> character_name -> per-char traits -> outfit -> pose/action
-       -> framing -> l
+       -> framing -> location -> time/lighting -> mood -> body
+       -> artist -> style -> intimacy -> year/source/rating -> quality
+       -> custom extras
+```
+
+## Supported model families
+
+- **Illustrious-XL** (and any merge with `illustrious` in the filename)
+- **NoobAI XL** (v-pred and eps)
+
+Detection reads `shared.opts.sd_model_checkpoint`. Override in the dropdown
+if auto-detect picks wrong.
+
+## Install
+
+Already installed at `extensions/sd-forge-prompt-enhancer`. Restart Forge
+once after first install — `install.py` will install `onnxruntime` (GPU
+build if available, CPU fallback) so the WD14 tagger can run.
+
+## Files
+
+- `install.py` — installs onnxruntime + Pillow if missing.
+- `artists.txt` — bundled list of 33,719 Illustrious / NoobAI compatible
+  Danbooru artist tags (from
+  [ThetaCursed/Illustrious-NoobAI-Style-Explorer](https://github.com/ThetaCursed/Illustrious-NoobAI-Style-Explorer)).
+- `scripts/prompt_enhancer.py` — builder UI + tag dictionaries + scenario
+  templates + WD14 tagger + Danbooru preview + paste-params wiring.
+- `wd14_model/` — lazy-downloaded on first analyze (gitignored).
+
+## Credits
+
+- **SmilingWolf** — WD14 ViT-v3 tagger model.
+- **OnomaAI Research** — Illustrious-XL.
+- **Laxhar Lab** — NoobAI-XL.
+- **ThetaCursed** — bundled artist list / style references.
