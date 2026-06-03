@@ -1,10 +1,10 @@
 # sd-forge-prompt-enhancer
 
-A **guided prompt builder** for Illustrious-XL and NoobAI XL on Forge. You pick
-from human-readable dropdowns (Pose: "sitting", Shot: "upper body", Style:
-"soft watercolor") and the extension translates each choice into the booru tags
-those models were trained on. You never need to know what "cowboy shot" or
-"rim lighting" means as a tag.
+A **guided prompt builder + reference-image tagger** for Illustrious-XL and
+NoobAI XL on Forge. You either pick from human-readable dropdowns (Pose:
+"sitting", Shot: "upper body", Style: "soft watercolor") and let the extension
+translate every choice into the right booru tags — or you upload a reference
+image and we reverse-engineer the tags directly.
 
 ## How to use
 
@@ -16,58 +16,55 @@ those models were trained on. You never need to know what "cowboy shot" or
 4. Click **Build prompt →**.
 5. Click **Send to txt2img** (or img2img) to paste both prompts into that tab.
 
-You can also design from scratch by leaving the scenario as
-"(none — design from scratch)" and filling each section yourself.
+Or for **1:1 image replication**:
+
+1. Open the **🖼️ Image to Prompt** accordion at the top.
+2. Upload a reference image, set thresholds.
+3. Click **🔍 Analyze image** — first use downloads the WD14 model (~360 MB).
+4. Click **🎯 Replicate (send to txt2img)** — the extracted tags + quality
+   boilerplate are pushed straight into the txt2img tab, ready to generate.
 
 ## What's inside
 
-### 9 sections (each is a dropdown):
+### Image-to-Prompt (WD14 ViT-v3 tagger)
 
-| # | Section | Examples |
+- **WD14 ViT-v3** by SmilingWolf — same Danbooru tagger family that trained
+  Illustrious / NoobAI, so its output drops straight into a 1:1 replication
+  prompt.
+- Lazy-downloads the ONNX model + tag list on first use (~360 MB total,
+  cached forever after).
+- Tag-confidence thresholds for general tags and character tags.
+- Outputs: detected character(s), general tags (composition / style /
+  details), and the Danbooru content rating.
+- Buttons: insert into your *Extra subject details* field, or replicate as
+  a full prompt and send straight to txt2img.
+
+### 11 builder sections (mostly dropdowns)
+
+| # | Section | Approximate option count |
 |---|---|---|
-| 1 | Subject / Character | Solo / 2girls / group · 1girl / 1boy / mature / child · character name |
-| 2 | Pose & Action | Standing / Sitting on chair / Lying on back · Looking at viewer / Holding cup / Peace sign |
-| 3 | Framing | Portrait / Upper body / Cowboy shot / Full body · From above / Dutch angle |
-| 4 | Outfit | 30+ presets: school uniform, kimono, swimsuit, fantasy armor, cyberpunk... |
-| 5 | Scene / Time / Lighting | 30+ locations · 9 time-of-day options · 10 lighting moods |
-| 6 | Expression & Mood | Smile / Smug / Sad / Determined / Sleepy ... |
-| 7 | Art Style (model-aware) | Detailed anime / Watercolor / Cinematic / Manga / Cel-shaded / Ghibli-esque ... |
-| 8 | Quality, Negative, Booru meta | Best/Standard/Minimal tiers · year/source/rating tags |
-| 9 | Custom extras | Free-text positive/negative additions (LoRA tags, artist tags, etc.) |
+| 1 | Subject / Character | 17 subjects + per-character traits + force-female-only + yuri |
+| 2 | Pose & Action | 64 poses · 66 actions |
+| 3 | Framing | 17 shot types · 8 camera angles |
+| 4 | Outfit | 91 presets (safe + [NSFW]) |
+| 5 | Scene / Time / Lighting | 81 locations · 10 times · 21 lighting moods |
+| 6 | Expression & Mood | 47 expressions (safe + [NSFW]) |
+| 7 | Art style preset | 33 visual style presets |
+| 8 | Quality, Negative, Booru meta | Best/Standard/Minimal tiers · year/source/rating |
+| 9 | Body / Physique | 26 body types (safe + [NSFW]) |
+| 9b | Artist style | Searchable dropdown over **33,719 artists** + Danbooru preview + strength slider |
+| 10 | Intimacy / NSFW level | 10 tiers from safe to explicit / fetish |
+| 11 | Custom extras | Free-text positive / negative additions |
 
 ### Scenario templates (one-click presets)
 
-Character portrait, Full-body reference sheet, School day, Cafe outing,
-Beach vacation, Combat scene, Magical girl, Idol performance, Summer festival,
-Cozy bedroom, Office worker, Cyberpunk night, Sci-fi space, Fantasy adventurer,
-Sakura, Rainy day, Winter snow, Goth portrait.
+39 ready-made scenes including Character portrait, School day, Beach vacation,
+Combat scene, Magical girl, Idol performance, Cafe outing, Library study,
+Karaoke night, Sushi date, Sunset rooftop, Camping fireside, New Year fireworks,
+plus 7 [NSFW] scenarios.
 
 ### Canonical Illustrious tag order (what we emit)
 
 ```
-subject -> character_name -> outfit -> pose/action -> framing
-       -> location -> time/lighting -> mood -> art-style
-       -> year/source/rating -> quality -> custom extras
-```
-
-This ordering matches the booru caption ordering Illustrious / NoobAI were
-trained on, which tends to give the most predictable results.
-
-## Supported model families
-
-- **Illustrious-XL** (and any merge with `illustrious` in the filename)
-- **NoobAI XL** (v-pred and eps)
-
-Detection reads `shared.opts.sd_model_checkpoint` and matches against the
-filename. Override in the dropdown if the auto-detect picks wrong.
-
-## Install
-
-Already installed at `extensions/sd-forge-prompt-enhancer`. Restart Forge to
-register the tab.
-
-## Files
-
-- `install.py` — stub (no external deps; gradio is provided by Forge).
-- `scripts/prompt_enhancer.py` — guided builder UI + tag dictionaries +
-  scenario templates + paste-params wiring.
+subject -> character_name -> per-char traits -> outfit -> pose/action
+       -> framing -> l

@@ -2,7 +2,7 @@
 sd-forge-prompt-enhancer / install.py
 =====================================
 
-Lightweight stub. Real work happens in scripts/prompt_enhancer.py at WebUI
-load time. The extension has zero external dependencies (gradio is provided
-by Forge itself), so nothing to install.
-"""
+Ensures onnxruntime is available for the WD14 image-to-prompt feature.
+Tries GPU build first (CUDA), falls back to CPU build.
+
+The 33k artist list and the gradio UI itself need nothing extra - For

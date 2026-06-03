@@ -4,6 +4,9 @@ __pycache__/
 *.pyo
 *.pyd
 
+# Lazy-downloaded WD14 ONNX model (~360 MB) — re-downloaded on first use
+wd14_model/
+
 # OS / editor
 .DS_Store
 Thumbs.db

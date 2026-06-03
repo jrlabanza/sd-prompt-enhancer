@@ -785,6 +785,765 @@ def _danbooru_preview_url(booru_tag, rating="g,s"):
         return None
 
 
+# ===========================================================================
+# WD14 image tagger (lazy-loaded)
+# ===========================================================================
+# SmilingWolf's WD14 ViT v3 tagger is the same family of model Illustrious /
+# NoobAI were trained against, so its output drops straight into an
+# Illustrious-format prompt for near 1:1 replication.
+
+# WD14 model registry. All v3 models use 448x448 input.
+WD14_MODELS = {
+    "Fast (ViT base, ~360MB)": {
+        "repo":   "SmilingWolf/wd-vit-tagger-v3",
+        "subdir": "vit_v3",
+    },
+    "Balanced (ViT large, ~1.1GB)": {
+        "repo":   "SmilingWolf/wd-vit-large-tagger-v3",
+        "subdir": "vit_large_v3",
+    },
+    "Best (EVA02 large, ~1.3GB - default for serious style detection)": {
+        "repo":   "SmilingWolf/wd-eva02-large-tagger-v3",
+        "subdir": "eva02_large_v3",
+    },
+}
+WD14_DEFAULT_MODEL_KEY = "Best (EVA02 large, ~1.3GB - default for serious style detection)"
+WD14_TARGET_SIZE = 448
+
+# Cached sessions keyed by model key -> (session, tags).
+_WD14_CACHE = {}
+
+# Style descriptor tags that live in WD14 category 0 (general) but actually
+# describe the art style / medium. We pull these out into their own field so
+# the user can see "this looks like a watercolor in a soft-pastel style" at a
+# glance. Tags are matched case-insensitively against the WD14 output name.
+# Scene-context tags pulled from the general bucket for the dedicated
+# "Scene context" output field. Each set groups thematically related Danbooru
+# tags so we can show the user a structured breakdown of when/where/weather/
+# lighting/season the image is set in. Match is case-insensitive.
+
+SCENE_TIME_TAGS = {
+    "morning", "daytime", "noon", "afternoon", "evening",
+    "sunset", "sunrise", "twilight", "dusk", "dawn",
+    "night", "midnight", "late_night",
+    "golden_hour", "blue_hour", "magic_hour",
+}
+SCENE_WEATHER_TAGS = {
+    "rain", "raining", "rainy", "drizzle",
+    "snow", "snowing", "snowflakes", "snowstorm",
+    "cloud", "clouds", "cloudy", "overcast",
+    "sunny", "clear_sky",
+    "fog", "foggy", "mist", "misty", "haze",
+    "storm", "stormy", "thunderstorm", "lightning",
+    "wind", "windy", "blizzard", "rainbow",
+    "hail", "sleet",
+}
+SCENE_LIGHTING_TAGS = {
+    "backlighting", "rim_lighting", "rim_light",
+    "dramatic_lighting", "cinematic_lighting", "soft_lighting",
+    "volumetric_lighting", "studio_lighting", "natural_lighting",
+    "low_light", "moody", "atmospheric_lighting",
+    "bright", "dark", "harsh_lighting",
+    "warm_lighting", "cool_lighting", "neon_lights",
+    "candlelight", "firelight", "lantern", "lanterns",
+    "spotlight", "side_lighting", "top_lighting",
+    "ambient_light", "key_light", "fill_light",
+    "god_rays", "light_rays", "sunbeam", "sunbeams",
+}
+SCENE_LOCATION_TAGS = {
+    "outdoors", "indoors",
+    "forest", "woods", "jungle", "tree", "trees",
+    "beach", "ocean", "sea", "shore", "sand",
+    "mountain", "mountains", "hill", "hills", "valley", "canyon",
+    "city", "cityscape", "skyline", "street", "alley", "rooftop",
+    "cafe", "coffee_shop", "restaurant", "diner", "bar",
+    "classroom", "school", "school_hallway", "schoolyard", "gym",
+    "bedroom", "kitchen", "bathroom", "living_room", "dining_room",
+    "office", "library", "bookstore", "store", "shop", "convenience_store",
+    "train", "train_interior", "subway", "car_interior", "airplane",
+    "shrine", "temple", "church", "cathedral", "castle", "dungeon",
+    "cave", "tunnel", "ruins",
+    "desert", "tundra", "field", "meadow", "garden", "park",
+    "river", "lake", "pond", "waterfall", "bridge", "pier",
+    "tower", "skyscraper", "balcony", "stairs", "hallway", "corridor",
+    "cyberpunk", "futuristic", "fantasy", "space", "spaceship_interior",
+    "stage", "concert", "festival", "amusement_park", "carnival",
+    "swimming_pool", "pool", "onsen", "hot_spring", "bathhouse",
+}
+SCENE_SEASON_TAGS = {
+    "spring", "summer", "autumn", "fall", "winter",
+    "cherry_blossoms", "cherry_blossom", "sakura",
+    "autumn_leaves", "fallen_leaves", "maple_leaf",
+    "snowflakes",
+    "flowers", "flower_field",
+}
+SCENE_SKY_TAGS = {
+    "sky", "blue_sky", "cloudy_sky", "starry_sky", "night_sky",
+    "stars", "star_(sky)", "milky_way", "galaxy",
+    "moon", "full_moon", "crescent_moon", "moonlight",
+    "sun", "sunlight", "aurora", "northern_lights",
+    "stratosphere", "cloud_sea",
+}
+
+WD14_STYLE_TAGS = {
+    # Medium
+    "watercolor", "watercolor_(medium)", "watercolor_painting",
+    "oil_painting", "oil_painting_(medium)", "acrylic_painting",
+    "ink_wash", "ink_wash_painting", "ink_drawing",
+    "pencil_drawing", "graphite_(medium)", "colored_pencil",
+    "marker_(medium)", "pastel_(medium)",
+    "digital_painting", "digital_media", "traditional_media",
+    "3d", "3d_(artwork)", "cg", "cgi", "render", "3d_render",
+    "pixel_art", "vector_art", "vector",
+    # Rendering style
+    "sketch", "lineart", "line_art", "rough_sketch",
+    "monochrome", "greyscale", "limited_palette",
+    "screentones", "halftone", "manga",
+    "cel_shading", "cel_shaded", "flat_color", "flat_colors", "flat_shading",
+    "painterly", "painterly_style", "brushstrokes",
+    "thick_outlines", "bold_outlines", "no_outlines",
+    "highly_detailed", "detailed", "intricate_details",
+    "simple_background_(style)", "minimalist",
+    # Color/palette feel
+    "pastel_colors", "vibrant_colors", "saturated", "muted_colors",
+    "warm_colors", "cool_colors", "pastel_palette",
+    "high_contrast", "low_contrast", "soft_lighting", "dramatic_lighting",
+    # Genre/style
+    "anime_style", "anime_coloring", "anime_screencap",
+    "realistic", "semi-realistic", "photorealistic", "hyperrealistic",
+    "chibi", "sd_character", "deformed",
+    "cartoon", "western_comic_book",
+    "official_art", "fan_art", "doujinshi",
+    # Texture / effect
+    "film_grain", "vhs_aesthetic", "vintage",
+    "blurry", "blurry_background", "depth_of_field", "bokeh",
+    "lens_flare", "chromatic_aberration",
+    "glitch", "glow", "shiny",
+}
+
+
+def _wd14_model_dir():
+    import os
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    d = os.path.join(here, "wd14_model")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _wd14_download(model_key, progress_cb=None):
+    """Download the WD14 ONNX model + tag list to a per-model subdir.
+    Idempotent - skips if files already exist."""
+    import os, urllib.request
+    info = WD14_MODELS.get(model_key)
+    if not info:
+        raise ValueError("Unknown WD14 model: {}".format(model_key))
+    base = _wd14_model_dir()
+    d = os.path.join(base, info["subdir"])
+    os.makedirs(d, exist_ok=True)
+    model_p = os.path.join(d, "model.onnx")
+    tags_p  = os.path.join(d, "selected_tags.csv")
+    model_url = "https://huggingface.co/{}/resolve/main/model.onnx".format(info["repo"])
+    tags_url  = "https://huggingface.co/{}/resolve/main/selected_tags.csv".format(info["repo"])
+
+    def _dl(url, dest, label):
+        if os.path.exists(dest) and os.path.getsize(dest) > 1024:
+            return
+        if progress_cb: progress_cb("Downloading {}...".format(label))
+        logger.info("{} downloading {} -> {}".format(TAG, url, dest))
+        tmp = dest + ".part"
+        urllib.request.urlretrieve(url, tmp)
+        os.replace(tmp, dest)
+
+    _dl(model_url, model_p, "{} model".format(model_key))
+    _dl(tags_url,  tags_p,  "{} tag list".format(model_key))
+    return model_p, tags_p
+
+
+def _wd14_load(model_key, progress_cb=None):
+    """Lazy-build and cache the ONNX session + parsed tag table for the
+    given model key. Subsequent calls with the same key return the cached
+    session immediately."""
+    if model_key in _WD14_CACHE:
+        return _WD14_CACHE[model_key]
+
+    model_p, tags_p = _wd14_download(model_key, progress_cb)
+
+    try:
+        import onnxruntime as ort
+    except ImportError as e:
+        raise RuntimeError(
+            "onnxruntime not installed. Restart Forge once after the "
+            "extension installs - install.py pip-installs onnxruntime "
+            "automatically."
+        ) from e
+
+    if progress_cb: progress_cb("Loading {} into memory...".format(model_key))
+    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    sess = ort.InferenceSession(model_p, providers=providers)
+
+    import csv
+    rows = []
+    with open(tags_p, "r", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            rows.append({
+                "name":     row["name"],
+                "category": int(row["category"]),
+                "count":    int(row.get("count", 0) or 0),
+            })
+
+    _WD14_CACHE[model_key] = (sess, rows)
+    return sess, rows
+
+
+def _wd14_preprocess(pil_img, target=WD14_TARGET_SIZE):
+    """Resize-with-pad to a square, convert to BGR float32, batch-dim."""
+    from PIL import Image
+    import numpy as np
+    img = pil_img.convert("RGB")
+    w, h = img.size
+    size = max(w, h)
+    canvas = Image.new("RGB", (size, size), (255, 255, 255))
+    canvas.paste(img, ((size - w) // 2, (size - h) // 2))
+    canvas = canvas.resize((target, target), Image.BICUBIC)
+    arr = np.array(canvas, dtype=np.float32)
+    arr = arr[:, :, ::-1]                     # RGB -> BGR (SmilingWolf convention)
+    arr = np.expand_dims(arr, axis=0)         # add batch dim
+    return arr
+
+
+def _parse_character_tag(tag):
+    """Parse a Danbooru character tag into (name, series_or_None).
+    Examples:
+      kafka_(honkai:_star_rail) -> ('kafka', 'honkai:_star_rail')
+      seele_vollerei            -> ('seele_vollerei', None)
+      hatsune_miku              -> ('hatsune_miku', None)
+      jeanne_d'arc_(fate)       -> ("jeanne_d'arc", 'fate')
+    """
+    import re
+    m = re.match(r"^(.+?)_\(([^)]+)\)$", tag)
+    if m:
+        return m.group(1), m.group(2)
+    return tag, None
+
+
+def _humanize_name(s):
+    """Convert a booru underscored name to human-readable Title Case.
+    Preserves embedded colons (e.g. 'honkai:_star_rail' -> 'Honkai: Star Rail').
+    """
+    if not s:
+        return s
+    out = s.replace("_", " ").strip()
+    # Title-case each word; preserve apostrophes and existing punctuation
+    words = out.split(" ")
+    cap = []
+    for w in words:
+        if not w:
+            continue
+        # Handle words like "d'arc" (keep d lowercase, Arc cased)
+        if "'" in w and len(w) > 1 and w[1] == "'":
+            cap.append(w[0].lower() + "'" + w[2:].capitalize())
+        else:
+            cap.append(w[0].upper() + w[1:] if w else "")
+    return " ".join(cap)
+
+
+def _format_character_display(tag, score):
+    """Render a character tag for display: 'Name - Series (NN%)'."""
+    name, series = _parse_character_tag(tag)
+    pretty_name = _humanize_name(name)
+    pretty_series = _humanize_name(series) if series else None
+    if pretty_series:
+        return "{} - {} ({:.0%})".format(pretty_name, pretty_series, score)
+    return "{} ({:.0%})".format(pretty_name, score)
+
+
+def _scan_metadata_for_characters(metadata_positive, all_char_predictions):
+    """If the metadata's positive prompt mentions a character that WD14 also
+    saw (at ANY confidence, not just above the threshold), promote those.
+    Returns list of (tag, score, source='metadata-confirmed').
+    """
+    if not metadata_positive:
+        return []
+    pos_lower = metadata_positive.lower()
+    promoted = []
+    for tag, score in all_char_predictions:
+        # Try exact tag match and name-only match against the prompt
+        name, _ = _parse_character_tag(tag)
+        if tag.lower() in pos_lower or name.lower() in pos_lower:
+            promoted.append((tag, max(score, 0.99)))  # promote to high confidence
+    return promoted
+
+
+def analyze_image_wd14(pil_img, general_threshold=0.35, character_threshold=0.55,
+                       artist_threshold=0.30, model_key=None, progress_cb=None):
+    if not model_key:
+        model_key = WD14_DEFAULT_MODEL_KEY
+    """Return {'general':..., 'characters':..., 'artists':..., 'styles':...,
+              'ratings':..., 'tag_string':str}.
+    Each list is [(tag, score)] sorted by score descending.
+    'styles' is a subset of 'general' filtered against WD14_STYLE_TAGS so the
+    user can see "this looks like watercolor / cel-shading / etc." at a glance.
+    """
+    sess, tags = _wd14_load(model_key, progress_cb)
+    arr = _wd14_preprocess(pil_img)
+    if progress_cb: progress_cb("Running inference...")
+
+    input_name  = sess.get_inputs()[0].name
+    output_name = sess.get_outputs()[0].name
+    preds = sess.run([output_name], {input_name: arr})[0][0]
+
+    ratings    = []
+    characters = []
+    characters_all = []  # ALL character predictions, no threshold, for x-ref
+    artists    = []
+    general    = []
+    for i, score in enumerate(preds):
+        tag = tags[i]
+        cat = tag["category"]
+        s   = float(score)
+        nm  = tag["name"]
+        if   cat == 9: ratings.append((nm, s))
+        elif cat == 4:
+            characters_all.append((nm, s))   # always collect, regardless of threshold
+            if s >= character_threshold:
+                characters.append((nm, s))
+        elif cat == 1:               # artist
+            if s >= artist_threshold:
+                artists.append((nm, s))
+        else:                         # 0 = general, also species/copyright
+            if s >= general_threshold:
+                general.append((nm, s))
+
+    general.sort(key=lambda t: -t[1])
+    characters.sort(key=lambda t: -t[1])
+    characters_all.sort(key=lambda t: -t[1])
+    artists.sort(key=lambda t: -t[1])
+    ratings.sort(key=lambda t: -t[1])
+
+    # Pull out style-descriptor tags from the general bucket.
+    style_lower = {s.lower() for s in WD14_STYLE_TAGS}
+    styles = [(nm, sc) for (nm, sc) in general if nm.lower() in style_lower]
+    # general_clean = general minus style tags (so they don't double-count in
+    # the main tag string).
+    general_clean = [(nm, sc) for (nm, sc) in general if nm.lower() not in style_lower]
+
+    # Replication string order (matches Illustrious caption convention):
+    #   characters -> artists -> general (minus style) -> style descriptors
+    parts = ([t[0] for t in characters]
+             + [t[0] for t in artists]
+             + [t[0] for t in general_clean]
+             + [t[0] for t in styles])
+    tag_string = ", ".join(parts)
+
+    # Scene context: group sub-buckets pulled from general_clean using the
+    # category whitelists. Lower the effective threshold here so weak signals
+    # (e.g. "golden_hour" at 0.28) still show up — these tags matter even at
+    # low confidence.
+    scene_buckets = {
+        "Time":     SCENE_TIME_TAGS,
+        "Weather":  SCENE_WEATHER_TAGS,
+        "Lighting": SCENE_LIGHTING_TAGS,
+        "Location": SCENE_LOCATION_TAGS,
+        "Season":   SCENE_SEASON_TAGS,
+        "Sky":      SCENE_SKY_TAGS,
+    }
+    # For scene tags we also peek into the raw predictions at a lower
+    # threshold (0.20) so we don't miss weak-but-correct environment cues.
+    SCENE_LOW_THRESHOLD = 0.20
+    scene_low_general = []
+    for i, score in enumerate(preds):
+        tag = tags[i]
+        if tag["category"] != 0:
+            continue
+        s = float(score)
+        if s >= SCENE_LOW_THRESHOLD:
+            scene_low_general.append((tag["name"], s))
+
+    scene_context = {}
+    for label, whitelist in scene_buckets.items():
+        wl_lower = {t.lower() for t in whitelist}
+        hits = [(nm, sc) for (nm, sc) in scene_low_general
+                if nm.lower() in wl_lower]
+        if hits:
+            hits.sort(key=lambda t: -t[1])
+            scene_context[label] = hits
+
+    return {
+        "general":         general_clean,
+        "characters":      characters,
+        "characters_all":  characters_all,    # full prediction list for x-ref
+        "artists":         artists,
+        "styles":          styles,
+        "ratings":         ratings,
+        "scene_context":   scene_context,
+        "tag_string":      tag_string,
+    }
+
+
+def _parse_a1111_params(text):
+    """Parse an A1111 / Forge-style parameters block.
+    Returns {'positive', 'negative', 'settings': {k: v}}.
+    Tolerant of missing fields."""
+    import re
+    out = {"positive": "", "negative": "", "settings": {}}
+    if not text or not text.strip():
+        return out
+    text = text.strip()
+
+    # Split positive from negative-and-rest
+    if "Negative prompt:" in text:
+        pos_part, rest = text.split("Negative prompt:", 1)
+        out["positive"] = pos_part.strip()
+        # Find where the settings line starts. Settings keys always come at the
+        # start of a new line and look like "Steps: 28, Sampler: Euler a, ...".
+        m = re.search(r'\n(Steps|Sampler|CFG scale|Seed|Size|Model|VAE|'
+                       r'Schedule type|Denoising strength|Clip skip|Hires|'
+                       r'ControlNet)[ a-zA-Z]*: ', rest)
+        if m:
+            out["negative"] = rest[:m.start()].strip()
+            settings_text  = rest[m.start():].lstrip()
+        else:
+            out["negative"] = rest.strip()
+            settings_text  = ""
+    else:
+        m = re.search(r'\n(Steps|Sampler|CFG scale|Seed|Size|Model|VAE|'
+                       r'Schedule type)[ a-zA-Z]*: ', text)
+        if m:
+            out["positive"] = text[:m.start()].strip()
+            settings_text  = text[m.start():].lstrip()
+        else:
+            out["positive"] = text.strip()
+            settings_text  = ""
+
+    # Parse settings. Values can contain commas inside quotes; A1111 doesn't
+    # quote consistently. We split on ", " followed by Capitalized key + ":".
+    if settings_text:
+        pairs = re.split(r',\s+(?=[A-Z][\w\s\-]*?:\s)', settings_text)
+        for pair in pairs:
+            if ":" not in pair:
+                continue
+            k, v = pair.split(":", 1)
+            out["settings"][k.strip()] = v.strip().rstrip(",")
+    return out
+
+
+def _parse_comfyui_workflow(workflow):
+    """Walk a ComfyUI workflow/prompt JSON. Returns positive/negative/settings.
+    Picks the longest CLIPTextEncode text as positive; nodes whose title hints
+    'negative' are treated as negative."""
+    out = {"positive": "", "negative": "", "settings": {}}
+    if not isinstance(workflow, dict):
+        return out
+    pos_candidates, neg_candidates = [], []
+    for _, node in workflow.items():
+        if not isinstance(node, dict): continue
+        class_type = node.get("class_type", "") or ""
+        inputs     = node.get("inputs", {}) or {}
+        meta       = node.get("_meta") if isinstance(node.get("_meta"), dict) else {}
+        title      = (meta.get("title", "") or "").lower()
+
+        if "CLIPTextEncode" in class_type:
+            t = inputs.get("text", "")
+            if isinstance(t, str) and t.strip():
+                if "negative" in title or "neg" in title:
+                    neg_candidates.append(t)
+                else:
+                    pos_candidates.append(t)
+
+        if "KSampler" in class_type or class_type.endswith("Sampler"):
+            for k in ("steps", "cfg", "sampler_name", "scheduler",
+                       "seed", "denoise"):
+                if k in inputs and not isinstance(inputs[k], list):
+                    out["settings"][k] = inputs[k]
+
+    if pos_candidates:
+        out["positive"] = max(pos_candidates, key=len).strip()
+    if neg_candidates:
+        out["negative"] = max(neg_candidates, key=len).strip()
+    return out
+
+
+def _parse_novelai_metadata(text_chunks):
+    """Parse NovelAI PNG metadata. Returns {'positive', 'negative', 'settings'}.
+
+    NAI's metadata lives in:
+      - Description: positive prompt (sometimes truncated)
+      - Comment: full JSON with prompt, uc, sampler, scale, seed, w/h, etc.
+      - v4 PNGs additionally have v4_prompt / v4_negative_prompt structured fields
+        with per-character captions inside data["v4_prompt"]["caption"].
+    """
+    out = {"positive": "", "negative": "", "settings": {}}
+    if not text_chunks:
+        return out
+
+    # ---- Description = positive prompt (NAI v3 + v4 fallback) ----
+    desc = text_chunks.get("Description", "")
+    if desc and isinstance(desc, str):
+        out["positive"] = desc.strip()
+
+    # ---- Comment = full generation JSON ----
+    comment = text_chunks.get("Comment", "")
+    if not comment or not isinstance(comment, str):
+        # Fall back to whatever Description gave us
+        return out
+    try:
+        import json
+        data = json.loads(comment)
+    except Exception:
+        return out
+    if not isinstance(data, dict):
+        return out
+
+    # Prefer the Comment JSON's "prompt" field if present (more reliable than
+    # the Description field, which can be truncated).
+    if isinstance(data.get("prompt"), str) and data["prompt"].strip():
+        out["positive"] = data["prompt"].strip()
+
+    # NAI v4 structured prompt overrides scalar "prompt".
+    v4p = data.get("v4_prompt")
+    if isinstance(v4p, dict):
+        cap = v4p.get("caption") if isinstance(v4p.get("caption"), dict) else None
+        if cap:
+            base = cap.get("base_caption", "")
+            if isinstance(base, str) and base.strip():
+                out["positive"] = base.strip()
+            # Layer per-character captions
+            chars = cap.get("char_captions", [])
+            if isinstance(chars, list) and chars:
+                char_strings = []
+                for c in chars:
+                    if isinstance(c, dict):
+                        cc = c.get("char_caption", "")
+                        if isinstance(cc, str) and cc.strip():
+                            char_strings.append(cc.strip())
+                if char_strings:
+                    out["positive"] += " | " + " | ".join(char_strings)
+
+    # Negative prompt: "uc" (NAI v3), then "negative_prompt", then v4_negative_prompt
+    if isinstance(data.get("uc"), str) and data["uc"].strip():
+        out["negative"] = data["uc"].strip()
+    elif isinstance(data.get("negative_prompt"), str) and data["negative_prompt"].strip():
+        out["negative"] = data["negative_prompt"].strip()
+
+    v4np = data.get("v4_negative_prompt")
+    if isinstance(v4np, dict):
+        cap = v4np.get("caption") if isinstance(v4np.get("caption"), dict) else None
+        if cap:
+            base = cap.get("base_caption", "")
+            if isinstance(base, str) and base.strip():
+                out["negative"] = base.strip()
+
+    # ---- Settings mapping (NAI -> A1111-like keys for consistent display) ----
+    settings_map = [
+        ("steps",                 "Steps"),
+        ("scale",                 "CFG scale"),
+        ("sampler",               "Sampler"),
+        ("seed",                  "Seed"),
+        ("noise_schedule",        "Schedule"),
+        ("cfg_rescale",           "CFG rescale"),
+        ("uncond_scale",          "Uncond scale"),
+        ("guidance",              "Guidance"),
+        ("guidance_rescale",      "Guidance rescale"),
+        ("dynamic_thresholding",  "Dynamic thresholding"),
+        ("dynamic_thresholding_percentile", "DT percentile"),
+        ("dynamic_thresholding_mimic_scale", "DT mimic scale"),
+        ("strength",              "Strength"),
+        ("noise",                 "Noise"),
+        ("model",                 "Model"),
+    ]
+    for nai_k, our_k in settings_map:
+        if nai_k in data and data[nai_k] not in (None, ""):
+            out["settings"][our_k] = data[nai_k]
+
+    # Combine width/height into Size
+    w = data.get("width"); h = data.get("height")
+    if isinstance(w, (int, float)) and isinstance(h, (int, float)):
+        out["settings"]["Size"] = "{}x{}".format(int(w), int(h))
+
+    # Include the SDXL base / NAI model hint from Source if present
+    src_field = text_chunks.get("Source", "")
+    if src_field and "Model" not in out["settings"]:
+        out["settings"]["Source"] = src_field
+
+    return out
+
+
+def _extract_image_metadata(pil_img):
+    """Stage 1 of the ultimate analyzer.
+    Returns {'source': 'a1111|forge|comfyui|none|exif',
+             'positive': str, 'negative': str, 'settings': dict,
+             'exif': dict, 'raw_text_chunks': dict}."""
+    out = {"source": "none", "positive": "", "negative": "",
+           "settings": {}, "exif": {}, "raw_text_chunks": {}}
+
+    if pil_img is None:
+        return out
+
+    # PNG text chunks (Pillow stores them in img.text after Image.open).
+    text_chunks = {}
+    try:
+        if hasattr(pil_img, "text") and isinstance(pil_img.text, dict):
+            text_chunks = dict(pil_img.text)
+        if hasattr(pil_img, "info") and isinstance(pil_img.info, dict):
+            # PIL also dumps PNG tEXt/zTXt chunks into .info
+            for k, v in pil_img.info.items():
+                if k not in text_chunks and isinstance(v, str):
+                    text_chunks[k] = v
+    except Exception:
+        pass
+    out["raw_text_chunks"] = text_chunks
+
+    # NovelAI format — check signature first (most specific).
+    # NAI sets Software="NovelAI" (and a Source line like "Stable Diffusion XL ...").
+    sw_or_src = "{} {}".format(text_chunks.get("Software", ""),
+                                text_chunks.get("Source", ""))
+    if "NovelAI" in sw_or_src:
+        parsed = _parse_novelai_metadata(text_chunks)
+        if parsed["positive"]:
+            out["source"] = "novelai"
+            out["positive"] = parsed["positive"]
+            out["negative"] = parsed["negative"]
+            out["settings"] = parsed["settings"]
+
+    # A1111 / Forge format
+    if out["source"] == "none" and "parameters" in text_chunks and isinstance(text_chunks["parameters"], str):
+        parsed = _parse_a1111_params(text_chunks["parameters"])
+        if parsed["positive"]:
+            out["source"] = "a1111/forge"
+            out["positive"] = parsed["positive"]
+            out["negative"] = parsed["negative"]
+            out["settings"] = parsed["settings"]
+
+    # ComfyUI format
+    if out["source"] == "none":
+        for k in ("workflow", "prompt"):
+            if k in text_chunks and isinstance(text_chunks[k], str):
+                try:
+                    import json
+                    wf = json.loads(text_chunks[k])
+                    parsed = _parse_comfyui_workflow(wf)
+                    if parsed["positive"]:
+                        out["source"] = "comfyui"
+                        out["positive"] = parsed["positive"]
+                        out["negative"] = parsed["negative"]
+                        out["settings"] = parsed["settings"]
+                        break
+                except Exception:
+                    continue
+
+    # EXIF (always extract; useful for photos)
+    try:
+        exif = pil_img.getexif() if hasattr(pil_img, "getexif") else {}
+        if exif:
+            from PIL.ExifTags import TAGS
+            for tag_id, val in exif.items():
+                tag = TAGS.get(tag_id, str(tag_id))
+                out["exif"][tag] = val
+            if out["source"] == "none" and out["exif"]:
+                out["source"] = "exif"
+    except Exception:
+        pass
+
+    return out
+
+
+def build_ultimate_prompt(metadata, wd14_result, artist_weight=1.20,
+                           style_weight=1.15, add_quality=True):
+    """Stage 3: merge metadata + WD14 into the most complete prompt.
+
+    Returns (positive_str, negative_str, info_dict).
+
+    Strategy:
+      - If metadata has a positive prompt -> that's the authoritative base.
+        WD14 only ADDS what's missing.
+      - If no metadata -> WD14 is everything.
+      - Artist + style tags get weight emphasis.
+      - Deduplication is case-insensitive against an accumulating lowercase set.
+    """
+    info = {"used_metadata": False, "layers": []}
+
+    seen_lower = set()
+    parts = []
+
+    def _split(s):
+        return [t.strip() for t in s.split(",") if t.strip()]
+
+    def _push(items, layer_label=None, wrap_strength=None):
+        added = 0
+        for it in items:
+            low = it.lower().lstrip("(").rstrip(")").split(":")[0].strip()
+            if not low or low in seen_lower:
+                continue
+            seen_lower.add(low)
+            if wrap_strength is not None and abs(wrap_strength - 1.0) > 0.01:
+                parts.append("({}:{:.2f})".format(it, wrap_strength))
+            else:
+                parts.append(it)
+            added += 1
+        if layer_label and added:
+            info["layers"].append("{}: +{}".format(layer_label, added))
+
+    # ---- Layer A: original metadata positive (authoritative base) ----
+    meta_pos = (metadata or {}).get("positive", "").strip()
+    if meta_pos:
+        _push(_split(meta_pos), layer_label="metadata original")
+        info["used_metadata"] = True
+
+    # ---- Layer B: WD14 artist tags (weighted) ----
+    artists = (wd14_result or {}).get("artists", []) or []
+    if artists:
+        _push([a[0] for a in artists[:5]],
+              layer_label="WD14 artist",
+              wrap_strength=artist_weight)
+
+    # ---- Layer C: WD14 characters ----
+    chars = (wd14_result or {}).get("characters", []) or []
+    if chars:
+        _push([c[0] for c in chars], layer_label="WD14 character")
+
+    # ---- Layer D: scene context (time/location/lighting/weather/season/sky) ----
+    sc = (wd14_result or {}).get("scene_context", {}) or {}
+    scene_picks = []
+    for label in ("Time", "Location", "Lighting", "Weather", "Season", "Sky"):
+        for tag, _ in (sc.get(label) or [])[:3]:
+            scene_picks.append(tag)
+    if scene_picks:
+        _push(scene_picks, layer_label="WD14 scene")
+
+    # ---- Layer E: WD14 style descriptors (weighted) ----
+    styles = (wd14_result or {}).get("styles", []) or []
+    if styles:
+        _push([s[0] for s in styles[:8]],
+              layer_label="WD14 style",
+              wrap_strength=style_weight)
+
+    # ---- Layer F: WD14 general tags ----
+    general = (wd14_result or {}).get("general", []) or []
+    if general:
+        _push([g[0] for g in general[:20]], layer_label="WD14 general")
+
+    # ---- Layer G: quality boilerplate ----
+    if add_quality:
+        _push(_split("masterpiece, best quality, very aesthetic, absurdres, newest"),
+              layer_label="quality")
+
+    positive = ", ".join(parts)
+
+    # ---- Negative ----
+    meta_neg = (metadata or {}).get("negative", "").strip()
+    if meta_neg:
+        negative = meta_neg
+        info["negative_source"] = "metadata"
+    else:
+        negative = ("worst quality, low quality, normal quality, lowres, "
+                    "bad anatomy, bad hands, watermark, signature, "
+                    "jpeg artifacts, blurry, sketch")
+        info["negative_source"] = "default"
+
+    return positive, negative, info
+
+
 def _artist_emit(label: str, strength: float = 1.0) -> str:
     """Return the artist tag formatted for the prompt.
     Strength of 1.0 emits the bare tag; other strengths wrap as (tag:strength)."""
@@ -1733,6 +2492,387 @@ def build_prompt(
 # Gradio UI
 # ===========================================================================
 
+# ===========================================================================
+# ControlNet recipe builder
+# ===========================================================================
+# Forge stores ControlNet models in models/controlnet/ relative to the Forge
+# install root. We scan that folder once at import time, classify each model
+# file by name, and use that to populate the recipe UI.
+
+CN_TYPE_KEYWORDS = {
+    "canny":     ["canny"],
+    "depth":     ["depth"],
+    "openpose":  ["openpose", "pose"],
+    "lineart":   ["lineart", "line_art", "line-art"],
+    "scribble":  ["scribble"],
+    "tile":      ["tile"],
+    "union":     ["union", "promax"],   # xinsir union/promax all-in-one
+    "ipadapter": ["ip-adapter", "ip_adapter", "ipadapter"],
+}
+
+CN_INSTALLED = {k: [] for k in CN_TYPE_KEYWORDS}
+
+
+def _scan_controlnet_models():
+    """Find SDXL CN models on disk and group them by type. Idempotent."""
+    import os
+    global CN_INSTALLED
+
+    # Forge installs at <forge_root>/models/controlnet/ — derive from this
+    # script path: scripts/ -> extension/ -> extensions/ -> <forge_root>.
+    here = os.path.dirname(os.path.abspath(__file__))
+    forge_root = os.path.normpath(os.path.join(here, "..", "..", ".."))
+    search_paths = [
+        os.path.join(forge_root, "models", "controlnet"),
+        os.path.join(forge_root, "models", "ControlNet"),
+    ]
+
+    # F:/Data/Models is the common StabilityMatrix shared model dir — the user
+    # has IP-Adapter SDXL files there too. We scan it as a secondary source.
+    extra = os.environ.get("PE_EXTRA_CN_PATH", "")
+    if extra:
+        search_paths.append(extra)
+    for guess in [r"F:\Data\Models\IpAdapter", r"F:\Data\Models\IpAdaptersXl",
+                  r"F:\Data\Models\ControlNet"]:
+        if os.path.isdir(guess):
+            search_paths.append(guess)
+
+    seen_files = set()
+    for cat in CN_INSTALLED:
+        CN_INSTALLED[cat] = []
+
+    for p in search_paths:
+        if not os.path.isdir(p):
+            continue
+        # Walk into subdirs because StabilityMatrix sets up symlinked subfolders
+        # like models/controlnet/IpAdapter -> F:/Data/Models/IpAdapter/. Limit
+        # depth so we don't drift into a clip-vision/preprocessor jungle.
+        try:
+            for dirpath, dirnames, filenames in os.walk(p, followlinks=True):
+                # Skip preprocessor caches that pile up large unrelated weights
+                low_dir = os.path.basename(dirpath).lower()
+                if low_dir in {"preprocessor", "annotator", "clip_vision",
+                               "controlnetpreprocessor", "annotators"}:
+                    dirnames[:] = []
+                    continue
+                rel = os.path.relpath(dirpath, p)
+                if rel != "." and rel.count(os.sep) > 2:
+                    dirnames[:] = []
+                    continue
+                for fn in filenames:
+                    low = fn.lower()
+                    if not (low.endswith(".safetensors") or low.endswith(".bin")
+                            or low.endswith(".pth") or low.endswith(".ckpt")):
+                        continue
+                    if fn in seen_files:
+                        continue
+                    seen_files.add(fn)
+                    if low.startswith("put_") or low.startswith("readme"):
+                        continue
+                    for cat, kws in CN_TYPE_KEYWORDS.items():
+                        if any(kw in low for kw in kws):
+                            CN_INSTALLED[cat].append(fn)
+                            break
+                    else:
+                        if "diffusion_pytorch_model" in low or "controlnet" in low:
+                            CN_INSTALLED["union"].append(fn)
+        except Exception as e:
+            logger.warning("{} CN scan failed for {}: {}".format(TAG, p, e))
+
+    # Stable sort: preference-friendly names first
+    def _rank(fn):
+        low = fn.lower()
+        score = 0
+        for pref in ["diffusers_xl_", "xinsir_", "kohya_controllllite_",
+                     "ip-adapter-plus_sdxl_vit-h", "ip-adapter-plus",
+                     "thibaud_", "controlnet-"]:
+            if low.startswith(pref): score -= 10
+            if pref in low:          score -= 5
+        # Promax/Union all-in-one is the most useful
+        if "promax" in low: score -= 20
+        return score
+    for cat in CN_INSTALLED:
+        CN_INSTALLED[cat] = sorted(CN_INSTALLED[cat], key=_rank)
+
+
+_scan_controlnet_models()
+logger.info("{} controlnet scan: {}".format(
+    TAG, {k: len(v) for k, v in CN_INSTALLED.items() if v}))
+
+
+def _cn_pick(cat, fallback=None):
+    """Best installed model name for a given category, or fallback string."""
+    lst = CN_INSTALLED.get(cat, [])
+    return lst[0] if lst else (fallback or "")
+
+
+def _import_forge_cn_external_code():
+    """Find Forge's ControlNet external_code module. Returns the module or None.
+    Forge has moved this around between versions, so we try every known path."""
+    candidates = [
+        "lib_controlnet.external_code",
+        "sd_forge_controlnet.lib_controlnet.external_code",
+        "extensions-builtin.sd_forge_controlnet.lib_controlnet.external_code",
+        "modules_forge.controlnet",
+    ]
+    for path in candidates:
+        try:
+            import importlib
+            mod = importlib.import_module(path)
+            if hasattr(mod, "ControlNetUnit") or hasattr(mod, "update_cn_script_in_processing"):
+                return mod
+        except Exception:
+            continue
+    # Last resort: walk sys.modules for an already-loaded one
+    import sys as _sys
+    for name, mod in list(_sys.modules.items()):
+        if mod is None: continue
+        if "external_code" in name and "controlnet" in name.lower():
+            return mod
+    return None
+
+
+def _build_cn_units(source_pil, enabled_units_spec):
+    """Build a list of ControlNet Unit objects from the user's per-unit spec.
+    enabled_units_spec is a list of dicts: {module, model, weight, guidance_end, etc.}
+    Each unit gets the same source_pil attached as its image.
+
+    Returns (units_list, error_str). units_list is the format Forge's
+    external_code expects; None on error.
+    """
+    if source_pil is None:
+        return None, "No source image uploaded."
+    if not enabled_units_spec:
+        return None, "No ControlNet units enabled."
+
+    mod = _import_forge_cn_external_code()
+    if mod is None:
+        return None, ("Forge's ControlNet external_code module not found. "
+                      "Make sure the built-in sd_forge_controlnet extension "
+                      "is enabled.")
+
+    if not hasattr(mod, "ControlNetUnit"):
+        return None, ("ControlNetUnit class not present in {} - your Forge "
+                      "build may be too old.".format(mod.__name__))
+
+    import numpy as np
+    # Many Forge versions accept PIL directly; some want numpy. We try PIL.
+    # If that errors at runtime we'll fall back to numpy below.
+    units = []
+    for spec in enabled_units_spec:
+        try:
+            unit = mod.ControlNetUnit(
+                enabled=True,
+                image=source_pil,
+                module=spec.get("module", "none"),
+                model=spec.get("model", ""),
+                weight=float(spec.get("weight", 1.0)),
+                resize_mode=spec.get("resize_mode", "Crop and Resize"),
+                low_vram=False,
+                processor_res=int(spec.get("processor_res", 1024)),
+                guidance_start=float(spec.get("guidance_start", 0.0)),
+                guidance_end=float(spec.get("guidance_end", 1.0)),
+                pixel_perfect=True,
+                control_mode=spec.get("control_mode", "Balanced"),
+            )
+        except TypeError:
+            # Newer Forge ControlNetUnit may use different keyword names.
+            # Try a stripped-down call.
+            try:
+                unit = mod.ControlNetUnit(
+                    enabled=True,
+                    image=source_pil,
+                    module=spec.get("module", "none"),
+                    model=spec.get("model", ""),
+                    weight=float(spec.get("weight", 1.0)),
+                )
+            except Exception as e:
+                return None, "ControlNetUnit construction failed: {}".format(e)
+        units.append(unit)
+    return units, None
+
+
+def _attach_cn_units(p, units, mod):
+    """Wire the units into a processing object. Tries multiple Forge APIs."""
+    if mod is not None and hasattr(mod, "update_cn_script_in_processing"):
+        try:
+            mod.update_cn_script_in_processing(p, units)
+            return True, None
+        except Exception as e:
+            return False, "update_cn_script_in_processing failed: {}".format(e)
+    # Fallback: set script_args directly.
+    try:
+        existing = list(getattr(p, "script_args", []) or [])
+        # ControlNet expects its args as a flat list in script_args. Convention:
+        # script_args[0] is often a stateful marker; we just append the units.
+        p.script_args = (*existing, *units)
+        return True, None
+    except Exception as e:
+        return False, "script_args fallback failed: {}".format(e)
+
+
+# SDXL training resolution buckets. Each entry is (width, height). Both base
+# and most fine-tunes (Illustrious, NoobAI, Pony, etc.) were trained on this
+# bucket set, so generating at one of these gives the cleanest output.
+SDXL_BUCKETS = [
+    (1024, 1024),  # 1:1 square
+    (1152, 896),   # 1.29:1 landscape
+    (896, 1152),   # 0.78:1 portrait
+    (1216, 832),   # 1.46:1 landscape
+    (832, 1216),   # 0.68:1 portrait  (NAI default)
+    (1344, 768),   # 1.75:1 landscape (16:9-ish)
+    (768, 1344),   # 0.57:1 portrait
+    (1536, 640),   # 2.4:1 wide
+    (640, 1536),   # 0.42:1 tall
+]
+
+
+def _snap_to_8(n):
+    """SDXL latents need dimensions divisible by 8."""
+    return int(round(n / 8) * 8)
+
+
+def _snap_to_sdxl_bucket(w, h):
+    """Pick the SDXL bucket closest to the source aspect ratio.
+    Returns (bucket_w, bucket_h). Ties broken by total pixel count (smaller wins)."""
+    if w <= 0 or h <= 0:
+        return 1024, 1024
+    src_aspect = w / float(h)
+    def _score(bucket):
+        bw, bh = bucket
+        ba = bw / float(bh)
+        # Compare aspect ratio in log space so 16:9 vs 9:16 are symmetric
+        import math
+        return abs(math.log(ba) - math.log(src_aspect))
+    return min(SDXL_BUCKETS, key=_score)
+
+
+def _compute_output_size(mode_label, source_pil, slider_w, slider_h,
+                          max_dim=1536):
+    """Return (width, height) based on the chosen resolution mode."""
+    if source_pil is None:
+        return int(slider_w), int(slider_h)
+
+    if mode_label and "Snap" in mode_label:
+        sw, sh = source_pil.size
+        bw, bh = _snap_to_sdxl_bucket(sw, sh)
+        return bw, bh
+
+    if mode_label and ("Match" in mode_label or "Source" in mode_label):
+        sw, sh = source_pil.size
+        # Cap absurdly large source images to max_dim while keeping aspect ratio
+        if max(sw, sh) > max_dim:
+            scale = max_dim / float(max(sw, sh))
+            sw = int(sw * scale); sh = int(sh * scale)
+        return _snap_to_8(sw), _snap_to_8(sh)
+
+    # Custom mode: use the sliders verbatim
+    return int(slider_w), int(slider_h)
+
+
+def _run_replication_generate(source_pil, positive, negative, units_spec,
+                               steps=28, sampler="Euler a", cfg=6.0,
+                               width=1024, height=1024, seed=-1,
+                               mode="img2img", denoise=0.55):
+    """Top-level replication generator. Returns (PIL.Image|None, info_str).
+    mode = 'txt2img' (pure noise start) or 'img2img' (source as init image)."""
+    if source_pil is None:
+        return None, "No source image."
+
+    try:
+        from modules import processing, shared
+    except Exception as e:
+        return None, "Forge processing module not importable: {}".format(e)
+
+    if not getattr(shared, "sd_model", None):
+        return None, ("No checkpoint loaded. Open the txt2img tab once "
+                      "to load a model, then come back.")
+
+    units, err = _build_cn_units(source_pil, units_spec)
+    if err:
+        return None, err
+
+    mod = _import_forge_cn_external_code()
+
+    try:
+        if mode == "img2img":
+            # img2img path: source is the init image, lower denoise = closer to source
+            p = processing.StableDiffusionProcessingImg2Img(
+                sd_model=shared.sd_model,
+                outpath_samples=shared.opts.outdir_img2img_samples,
+                outpath_grids=shared.opts.outdir_img2img_grids,
+                prompt=positive,
+                negative_prompt=negative,
+                steps=int(steps),
+                sampler_name=str(sampler),
+                cfg_scale=float(cfg),
+                width=int(width),
+                height=int(height),
+                seed=int(seed),
+                n_iter=1,
+                batch_size=1,
+                init_images=[source_pil],
+                denoising_strength=float(denoise),
+                do_not_save_samples=False,
+                do_not_save_grid=True,
+            )
+        else:
+            p = processing.StableDiffusionProcessingTxt2Img(
+                sd_model=shared.sd_model,
+                outpath_samples=shared.opts.outdir_txt2img_samples,
+                outpath_grids=shared.opts.outdir_txt2img_grids,
+                prompt=positive,
+                negative_prompt=negative,
+                steps=int(steps),
+                sampler_name=str(sampler),
+                cfg_scale=float(cfg),
+                width=int(width),
+                height=int(height),
+                seed=int(seed),
+                n_iter=1,
+                batch_size=1,
+                do_not_save_samples=False,
+                do_not_save_grid=True,
+            )
+
+        ok, attach_err = _attach_cn_units(p, units, mod)
+        if not ok:
+            return None, attach_err
+
+        processed = processing.process_images(p)
+        if not processed or not processed.images:
+            return None, "No image returned by processing."
+        return processed.images[0], (processed.info or "")
+    except Exception as e:
+        import traceback
+        return None, "Generation failed: {}\n{}".format(e, traceback.format_exc()[-500:])
+
+
+def _build_controlnet_infotext(units):
+    """Format a list of CN unit dicts as Forge infotext lines.
+    Each dict: {module, model, weight, guidance_start, guidance_end,
+                resize_mode, control_mode, pixel_perfect}.
+    """
+    out = []
+    for i, u in enumerate(units):
+        if not u.get("model"):
+            continue
+        parts = [
+            'Module: "{}"'.format(u.get("module", "none")),
+            'Model: "{}"'.format(u["model"]),
+            "Weight: {:.2f}".format(float(u.get("weight", 1.0))),
+            'Resize Mode: "{}"'.format(u.get("resize_mode", "Crop and Resize")),
+            "Low Vram: False",
+            'Processor Res: 1024',
+            "Guidance Start: {:.2f}".format(float(u.get("guidance_start", 0.0))),
+            "Guidance End:   {:.2f}".format(float(u.get("guidance_end", 1.0))),
+            'Pixel Perfect: True',
+            'Control Mode: "{}"'.format(u.get("control_mode", "Balanced")),
+        ]
+        out.append("ControlNet {}: \"{}\"".format(i, ", ".join(parts)))
+    return ", ".join(out) if out else ""
+
+
 def _on_ui_tabs():
     with gr.Blocks(analytics_enabled=False) as ui:
         gr.Markdown(
@@ -1764,6 +2904,290 @@ def _on_ui_tabs():
                 value="(none — design from scratch)",
             )
             apply_scenario_btn = gr.Button("Apply scenario", variant="secondary")
+
+        with gr.Accordion("🖼️  Image to Prompt — analyze a reference image",
+                          open=False):
+            gr.Markdown(
+                "Upload an image (your own art, a reference, a screenshot — "
+                "anything). The **WD14 v3 tagger** (the Danbooru tagger family "
+                "that trained Illustrious / NoobAI) extracts booru-format "
+                "tags directly from the pixels.\n\n"
+                "**For real style replication, use 'Best (EVA02 large)'** "
+                "(default). The base ViT model is faster but its artist "
+                "detection is shaky. Detected artist + style tags are "
+                "emitted with weight emphasis like `(wlop:1.20)` so the "
+                "latent is actually pulled toward that style.\n\n"
+                "**First use of each model downloads it (~360 MB - ~1.3 GB, "
+                "one-time).** Subsequent analyses are instant."
+            )
+
+            with gr.Row():
+                analyze_image_input = gr.Image(
+                    label="Reference image",
+                    type="pil",
+                    height=380,
+                )
+                with gr.Column():
+                    wd14_general_thresh = gr.Slider(
+                        label="General-tag threshold (lower = more tags)",
+                        minimum=0.15, maximum=0.60, step=0.01, value=0.35,
+                    )
+                    wd14_char_thresh = gr.Slider(
+                        label="Character-tag threshold — lower = more candidates surface (recommended 0.55)",
+                        minimum=0.30, maximum=0.95, step=0.01, value=0.55,
+                    )
+                    wd14_artist_thresh = gr.Slider(
+                        label="Artist-tag threshold (lower = catches more artist guesses)",
+                        minimum=0.15, maximum=0.70, step=0.01, value=0.30,
+                    )
+                    wd14_model_dd = gr.Dropdown(
+                        label="WD14 model — bigger = better artist + style detection",
+                        choices=list(WD14_MODELS.keys()),
+                        value=WD14_DEFAULT_MODEL_KEY,
+                    )
+                    artist_weight_slider = gr.Slider(
+                        label="🎨 Artist tag weight (>1.0 forces style harder)",
+                        minimum=0.5, maximum=1.5, step=0.05, value=1.20,
+                    )
+                    style_weight_slider = gr.Slider(
+                        label="🎨 Style descriptor weight (>1.0 forces medium harder)",
+                        minimum=0.5, maximum=1.5, step=0.05, value=1.15,
+                    )
+                    add_quality_cb = gr.Checkbox(
+                        label="Wrap tags with Illustrious quality + standard negative",
+                        value=True,
+                    )
+                    analyze_btn = gr.Button(
+                        "🔍  Analyze image", variant="primary", size="lg",
+                    )
+
+            analyze_status = gr.Markdown(
+                value="*Upload an image, set the thresholds, then click Analyze.*"
+            )
+
+            extracted_chars_box = gr.Textbox(
+                label="🧑 Detected character(s) — primary + others + metadata cross-check",
+                lines=4,
+                show_copy_button=True,
+            )
+            extracted_artist_box = gr.Textbox(
+                label="Detected artist style(s) + medium / rendering style",
+                lines=2,
+                show_copy_button=True,
+            )
+            extracted_tags_box = gr.Textbox(
+                label="Extracted tags (1:1 replication prompt)",
+                lines=5,
+                show_copy_button=True,
+            )
+            extracted_scene_box = gr.Textbox(
+                label="🌍 Scene context — Time / Weather / Lighting / Location / Season / Sky",
+                lines=4,
+                show_copy_button=True,
+            )
+            extracted_rating_box = gr.Textbox(
+                label="Content rating (Danbooru)",
+                lines=1,
+            )
+
+            gr.Markdown("---")
+            gr.Markdown("### 📜 Stage 1: Metadata embedded in the image")
+            extracted_meta_source = gr.Textbox(
+                label="Metadata source (A1111 / Forge / ComfyUI / EXIF / none)",
+                lines=1,
+            )
+            extracted_meta_positive = gr.Textbox(
+                label="Original positive prompt (if image is AI-generated)",
+                lines=4,
+                show_copy_button=True,
+            )
+            extracted_meta_negative = gr.Textbox(
+                label="Original negative prompt",
+                lines=2,
+                show_copy_button=True,
+            )
+            extracted_meta_settings = gr.Textbox(
+                label="Original generation settings (steps, sampler, CFG, seed, size, model)",
+                lines=3,
+                show_copy_button=True,
+            )
+
+            gr.Markdown("---")
+            gr.Markdown(
+                "### 🪄 Stage 3: Ultimate Prompt — metadata first, then WD14 "
+                "artist (weighted) + characters + scene + style + general tags "
+                "+ quality boilerplate. Deduped case-insensitively."
+            )
+            ultimate_prompt_box = gr.Textbox(
+                label="✨ Ultimate positive prompt (use this for replication)",
+                lines=6,
+                show_copy_button=True,
+            )
+            ultimate_negative_box = gr.Textbox(
+                label="✨ Ultimate negative prompt",
+                lines=3,
+                show_copy_button=True,
+            )
+            ultimate_info_box = gr.Markdown(
+                value="*Click **Analyze image** to populate the ultimate "
+                      "prompt. The 'Generate replication NOW' button below "
+                      "uses this.*"
+            )
+
+            with gr.Row():
+                insert_into_subject_btn = gr.Button(
+                    "↩️  Insert WD14 tags into 'Extra subject details' above",
+                    scale=1,
+                )
+                replicate_t2i_btn = gr.Button(
+                    "🎯  Replicate (send to txt2img)",
+                    variant="primary",
+                    scale=1,
+                )
+
+            # Hidden state holds the formatted-for-paste prompt string.
+            replicate_params_state = gr.Textbox(visible=False)
+
+            gr.Markdown("---")
+            gr.Markdown(
+                "### 🎮 ControlNet recipe (for closer 1:1 replication)\n"
+                "Tags alone get you ~70% of the way. **ControlNet locks in "
+                "composition, pose, and outlines from the reference image — "
+                "the remaining 30%.** Tick the units you want, click the "
+                "**Send to txt2img with ControlNet preset** button below, "
+                "then in txt2img drop the **same source image** into each "
+                "enabled unit's image input (Forge's paste API can't transfer "
+                "images across tabs — only the model + weights). Hit Generate."
+            )
+
+            # Render a short installed-models summary so the user sees what's available
+            _installed_md_lines = ["**Detected on your install:**"]
+            for cat_label, key in [
+                ("Canny", "canny"), ("Depth", "depth"),
+                ("OpenPose", "openpose"), ("Lineart", "lineart"),
+                ("Tile", "tile"), ("Union/Promax (all-in-one)", "union"),
+                ("IP-Adapter (style transfer)", "ipadapter"),
+            ]:
+                lst = CN_INSTALLED.get(key, [])
+                if lst:
+                    _installed_md_lines.append(
+                        "- **{}**: `{}`{}".format(
+                            cat_label, lst[0],
+                            "" if len(lst) == 1 else " (+{} more)".format(len(lst) - 1)
+                        ))
+                else:
+                    _installed_md_lines.append("- {} — *(none installed)*".format(cat_label))
+            gr.Markdown("\n".join(_installed_md_lines))
+
+            replicate_mode_radio = gr.Radio(
+                label="Replication mode",
+                choices=["txt2img (creative — generate from prompt + CN)",
+                         "img2img (1:1 — starts from your source image)"],
+                value="img2img (1:1 — starts from your source image)",
+            )
+            replicate_denoise = gr.Slider(
+                label="Denoise (img2img only) — lower = closer to source",
+                minimum=0.20, maximum=0.95, step=0.02, value=0.55,
+            )
+            replicate_intensity = gr.Radio(
+                label="🎯 Replication intensity preset (tunes all the weights below)",
+                choices=[
+                    "Loose (creative variation)",
+                    "Balanced (closer match)",
+                    "Strict (near-1:1) - recommended",
+                    "Maximum (almost identical)",
+                ],
+                value="Strict (near-1:1) - recommended",
+            )
+
+            with gr.Row():
+                cn_canny_cb = gr.Checkbox(
+                    label="Canny edges (structure lock)", value=True,
+                    interactive=bool(CN_INSTALLED["canny"] or CN_INSTALLED["union"]),
+                )
+                cn_canny_weight = gr.Slider(label="weight", minimum=0.0, maximum=1.5, step=0.05, value=0.85)
+                cn_canny_end = gr.Slider(label="end step", minimum=0.0, maximum=1.0, step=0.05, value=0.70)
+
+            with gr.Row():
+                cn_depth_cb = gr.Checkbox(
+                    label="Depth (3D layout)", value=True,
+                    interactive=bool(CN_INSTALLED["depth"] or CN_INSTALLED["union"]),
+                )
+                cn_depth_weight = gr.Slider(label="weight", minimum=0.0, maximum=1.5, step=0.05, value=0.65)
+                cn_depth_end = gr.Slider(label="end step", minimum=0.0, maximum=1.0, step=0.05, value=0.60)
+
+            with gr.Row():
+                cn_pose_cb = gr.Checkbox(
+                    label="OpenPose (character pose)", value=False,
+                    interactive=bool(CN_INSTALLED["openpose"] or CN_INSTALLED["union"]),
+                )
+                cn_pose_weight = gr.Slider(label="weight", minimum=0.0, maximum=1.5, step=0.05, value=0.80)
+                cn_pose_end = gr.Slider(label="end step", minimum=0.0, maximum=1.0, step=0.05, value=0.80)
+
+            with gr.Row():
+                cn_tile_cb = gr.Checkbox(
+                    label="Tile (preserves colors + coarse layout — great for upscaling/refine)",
+                    value=False,
+                    interactive=bool(CN_INSTALLED["tile"]),
+                )
+                cn_tile_weight = gr.Slider(label="weight", minimum=0.0, maximum=1.5, step=0.05, value=0.50)
+                cn_tile_end = gr.Slider(label="end step", minimum=0.0, maximum=1.0, step=0.05, value=0.80)
+
+            with gr.Row():
+                cn_ipadapter_cb = gr.Checkbox(
+                    label="🎨 IP-Adapter Plus (style / image transfer — KEY for art style replication)",
+                    value=True,
+                    interactive=bool(CN_INSTALLED["ipadapter"]),
+                )
+                cn_ipadapter_weight = gr.Slider(label="weight", minimum=0.0, maximum=1.5, step=0.05, value=0.90)
+                cn_ipadapter_end = gr.Slider(label="end step", minimum=0.0, maximum=1.0, step=0.05, value=1.00)
+
+            replicate_resolution_mode = gr.Radio(
+                label="Output size — match source dimensions or snap to SDXL bucket",
+                choices=[
+                    "Match source image dimensions",
+                    "Snap to nearest SDXL training bucket (recommended)",
+                    "Custom (use Width/Height sliders below)",
+                ],
+                value="Snap to nearest SDXL training bucket (recommended)",
+            )
+
+            with gr.Accordion("Generation settings (only for the direct-generate button)",
+                              open=False):
+                with gr.Row():
+                    cn_steps = gr.Slider(label="Steps", minimum=10, maximum=60, step=1, value=28)
+                    cn_cfg   = gr.Slider(label="CFG", minimum=2.0, maximum=12.0, step=0.5, value=6.0)
+                with gr.Row():
+                    cn_sampler = gr.Dropdown(
+                        label="Sampler",
+                        choices=["Euler a", "Euler", "DPM++ 2M",
+                                 "DPM++ 2M Karras", "DPM++ SDE",
+                                 "DPM++ 3M SDE", "UniPC", "LCM"],
+                        value="Euler a",
+                    )
+                    cn_seed = gr.Number(label="Seed (-1 = random)", value=-1, precision=0)
+                with gr.Row():
+                    cn_width  = gr.Slider(label="Width",  minimum=512, maximum=1536, step=64, value=1024)
+                    cn_height = gr.Slider(label="Height", minimum=512, maximum=1536, step=64, value=1024)
+
+            with gr.Row():
+                generate_cn_btn = gr.Button(
+                    "🎯 Generate replication NOW (auto-attaches image to CN units)",
+                    variant="primary", size="lg",
+                )
+
+            cn_status = gr.Markdown(
+                value="*This button bypasses the txt2img tab and runs the generation "
+                      "directly with ControlNet pre-configured + your reference image "
+                      "already attached to every enabled unit. Result appears below.*"
+            )
+
+            cn_result_image = gr.Image(
+                label="Replication result",
+                interactive=False,
+                show_download_button=True,
+                height=520,
+            )
 
         with gr.Accordion("1. Subject / Character", open=True):
             subject_dd = gr.Dropdown(
@@ -2141,6 +3565,435 @@ def _on_ui_tabs():
                      expression_dd, style_dd, status],
         )
 
+        # ---------- Image-to-Prompt wiring ----------
+
+        def _weighted(tag_list, strength):
+            """Apply (tag:strength) wrapping when strength != 1.0."""
+            if abs(strength - 1.0) < 0.01:
+                return ", ".join([t[0] for t in tag_list])
+            return ", ".join(["({}:{:.2f})".format(t[0], strength) for t in tag_list])
+
+        ILLUSTRIOUS_REPLICATE_QUALITY = (
+            "masterpiece, best quality, very aesthetic, absurdres, newest"
+        )
+        ILLUSTRIOUS_REPLICATE_NEGATIVE = (
+            "worst quality, low quality, normal quality, lowres, "
+            "bad anatomy, bad hands, watermark, signature, jpeg artifacts, "
+            "blurry, sketch"
+        )
+
+        def _do_analyze_image(img, gen_thr, char_thr, art_thr,
+                              model_key, artist_w, style_w, add_quality):
+            if img is None:
+                # 7 original outputs + 6 new = 13
+                return ("*No image uploaded.*", "", "", "", "", "", "",
+                        "", "", "", "", "", "")
+            try:
+                # ---- Stage 1: metadata ----
+                meta = _extract_image_metadata(img)
+
+                # ---- Stage 2: WD14 ----
+                res = analyze_image_wd14(
+                    img,
+                    general_threshold=float(gen_thr),
+                    character_threshold=float(char_thr),
+                    artist_threshold=float(art_thr),
+                    model_key=model_key)
+
+                # ---- Build structured character display ----
+                wd14_chars = res["characters"]
+                all_chars = res.get("characters_all", []) or wd14_chars
+                meta_promoted = _scan_metadata_for_characters(
+                    meta["positive"], all_chars)
+                # Merge: metadata-promoted at top, then WD14 above threshold,
+                # de-duplicated by tag.
+                seen_char_tags = set()
+                char_lines = []
+                if meta_promoted:
+                    parts = []
+                    for tag, sc in meta_promoted:
+                        if tag in seen_char_tags: continue
+                        seen_char_tags.add(tag)
+                        parts.append(_format_character_display(tag, sc))
+                    if parts:
+                        char_lines.append("**Confirmed from metadata prompt**: " + ", ".join(parts))
+                if wd14_chars:
+                    primary = None
+                    others = []
+                    for tag, sc in wd14_chars:
+                        if tag in seen_char_tags: continue
+                        seen_char_tags.add(tag)
+                        if primary is None:
+                            primary = (tag, sc)
+                        else:
+                            others.append((tag, sc))
+                    if primary:
+                        char_lines.append("**Primary**: " + _format_character_display(*primary))
+                    if others:
+                        char_lines.append("**Also detected**: " + ", ".join(
+                            _format_character_display(t, s) for t, s in others[:6]))
+                # Also surface near-misses (just below threshold) for awareness
+                near_misses = [
+                    (t, s) for (t, s) in all_chars
+                    if s < float(char_thr) and s >= max(0.30, float(char_thr) - 0.20)
+                    and t not in seen_char_tags
+                ][:4]
+                if near_misses:
+                    char_lines.append("**Near-miss candidates** (raise threshold to include): "
+                                       + ", ".join(_format_character_display(t, s)
+                                                    for t, s in near_misses))
+                chars = "\n".join(char_lines) or "(no character detected — try the Best WD14 model and lower the character threshold)"
+                rating = ", ".join(
+                    ["{} ({:.0%})".format(t[0], t[1]) for t in res["ratings"][:1]]
+                ) or "(unknown)"
+
+                # Apply weight emphasis to artists + style descriptors.
+                aw = float(artist_w)
+                sw = float(style_w)
+                weighted_chars   = _weighted(res["characters"], 1.0)
+                weighted_artists = _weighted(res["artists"], aw)
+                weighted_general = _weighted(res["general"], 1.0)
+                weighted_styles  = _weighted(res["styles"], sw)
+                tag_parts = [p for p in [weighted_chars, weighted_artists,
+                                          weighted_general, weighted_styles] if p]
+                tag_str = ", ".join(tag_parts)
+
+                # Build the human-readable Artist + Style display field.
+                artist_lines = []
+                if res["artists"]:
+                    art_str = ", ".join(
+                        ["{} ({:.0%}, weight {:.2f})".format(t[0], t[1], aw)
+                         for t in res["artists"][:8]]
+                    )
+                    artist_lines.append("Artists: " + art_str)
+                if res["styles"]:
+                    style_str = ", ".join(
+                        ["{} (weight {:.2f})".format(t[0], sw)
+                         for t in res["styles"]]
+                    )
+                    artist_lines.append("Style: " + style_str)
+                artist_field = "\n".join(artist_lines) or "(no artist or style descriptors detected — try the Best WD14 model and lower the artist threshold)"
+
+                # Build the structured Scene Context display.
+                scene_lines = []
+                for label in ["Time", "Weather", "Lighting", "Location",
+                              "Season", "Sky"]:
+                    hits = res["scene_context"].get(label, [])
+                    if hits:
+                        # Show top 5 with confidence in each bucket
+                        items = ", ".join(
+                            ["{} ({:.0%})".format(t[0], t[1]) for t in hits[:5]]
+                        )
+                        scene_lines.append("**{}**: {}".format(label, items))
+                scene_field = "\n".join(scene_lines) or "(no scene context detected)"
+
+                # Derive Size from the source image (snapped to nearest SDXL bucket)
+                # so the txt2img paste-button doesn't always land on 1024x1024.
+                try:
+                    _sw, _sh = img.size
+                    _pw, _ph = _snap_to_sdxl_bucket(_sw, _sh)
+                    paste_size = "{}x{}".format(_pw, _ph)
+                except Exception:
+                    paste_size = "1024x1024"
+
+                if add_quality:
+                    full_pos = "{}, {}".format(tag_str, ILLUSTRIOUS_REPLICATE_QUALITY)
+                    paste = ("{}\nNegative prompt: {}\nSteps: 28, "
+                             "Sampler: Euler a, CFG scale: 6, Size: {}"
+                             ).format(full_pos, ILLUSTRIOUS_REPLICATE_NEGATIVE,
+                                       paste_size)
+                else:
+                    full_pos = tag_str
+                    paste = ("{}\nSteps: 28, Sampler: Euler a, "
+                             "CFG scale: 6, Size: {}").format(full_pos, paste_size)
+
+                # ---- Build metadata display strings ----
+                meta_source = meta["source"]
+                meta_settings_str = ""
+                if meta["settings"]:
+                    meta_settings_str = ", ".join(
+                        ["{}: {}".format(k, v) for k, v in meta["settings"].items()]
+                    )
+                # Truncate ridiculously long EXIF dumps for the settings field
+                if meta["source"] == "exif" and meta_settings_str:
+                    # If EXIF only, show first few keys
+                    keys = ["Make", "Model", "Software", "DateTime",
+                            "DateTimeOriginal", "ISOSpeedRatings", "FNumber",
+                            "ExposureTime", "FocalLength"]
+                    parts = []
+                    for k in keys:
+                        if k in meta["exif"]:
+                            parts.append("{}: {}".format(k, meta["exif"][k]))
+                    if parts:
+                        meta_settings_str = " | ".join(parts)
+
+                # ---- Stage 3: Ultimate Prompt ----
+                ult_pos, ult_neg, ult_info = build_ultimate_prompt(
+                    meta, res,
+                    artist_weight=aw, style_weight=sw,
+                    add_quality=bool(add_quality))
+
+                if ult_info.get("used_metadata"):
+                    ult_md_status = (
+                        "✅ Ultimate prompt built from **{}** metadata + WD14 layers: "
+                        + " · ".join(ult_info["layers"])
+                    ).format(meta_source)
+                else:
+                    ult_md_status = (
+                        "✅ Ultimate prompt built from WD14 only (no embedded "
+                        "metadata in this image). Layers: "
+                        + " · ".join(ult_info["layers"])
+                    )
+
+                # ---- Replicate paste params now uses the ULTIMATE prompt
+                # and the SOURCE-IMAGE-DERIVED size (snapped to nearest SDXL bucket).
+                try:
+                    _sw, _sh = img.size
+                    _pw, _ph = _snap_to_sdxl_bucket(_sw, _sh)
+                    paste_size_ult = "{}x{}".format(_pw, _ph)
+                except Exception:
+                    paste_size_ult = "1024x1024"
+
+                if add_quality:
+                    paste = ("{}\nNegative prompt: {}\nSteps: 28, "
+                             "Sampler: Euler a, CFG scale: 6, Size: {}"
+                             ).format(ult_pos, ult_neg, paste_size_ult)
+                else:
+                    paste = ("{}\nSteps: 28, Sampler: Euler a, "
+                             "CFG scale: 6, Size: {}").format(ult_pos, paste_size_ult)
+
+                status_md = ("✅ {} model · {} metadata · "
+                             "**{}** general · **{}** artist · **{}** style · "
+                             "**{}** character(s) tags from WD14. Artist weight "
+                             "**{:.2f}**, style weight **{:.2f}**."
+                             ).format(model_key, meta_source,
+                                      len(res["general"]),
+                                      len(res["artists"]), len(res["styles"]),
+                                      len(res["characters"]), aw, sw)
+                return (status_md, chars, artist_field, scene_field,
+                        tag_str, rating, paste,
+                        meta_source, meta["positive"], meta["negative"],
+                        meta_settings_str, ult_pos, ult_neg)
+            except Exception as e:
+                import traceback
+                err = "❌ Analysis failed: `{}`\n```\n{}\n```".format(
+                    e, traceback.format_exc()[-500:])
+                return (err, "", "", "", "", "", "",
+                        "", "", "", "", "", "")
+
+        analyze_btn.click(
+            fn=_do_analyze_image,
+            inputs=[analyze_image_input, wd14_general_thresh,
+                    wd14_char_thresh, wd14_artist_thresh,
+                    wd14_model_dd, artist_weight_slider,
+                    style_weight_slider, add_quality_cb],
+            outputs=[analyze_status, extracted_chars_box,
+                     extracted_artist_box, extracted_scene_box,
+                     extracted_tags_box, extracted_rating_box,
+                     replicate_params_state,
+                     extracted_meta_source, extracted_meta_positive,
+                     extracted_meta_negative, extracted_meta_settings,
+                     ultimate_prompt_box, ultimate_negative_box],
+        )
+
+        # When a new image is uploaded, auto-set Width/Height to the snapped
+        # SDXL-bucket dimensions of the source so the resolution is visually
+        # obvious AND propagates to both Generate buttons (the slider values are
+        # what each handler reads).
+        def _on_image_upload(img):
+            if img is None:
+                return gr.update(), gr.update()
+            try:
+                w, h = img.size
+                bw, bh = _snap_to_sdxl_bucket(w, h)
+                return gr.update(value=bw), gr.update(value=bh)
+            except Exception:
+                return gr.update(), gr.update()
+
+        analyze_image_input.change(
+            fn=_on_image_upload,
+            inputs=[analyze_image_input],
+            outputs=[cn_width, cn_height],
+        )
+
+        def _do_insert_into_subject(tags, current):
+            if not tags or not tags.strip():
+                return current
+            parts = []
+            if current and current.strip():
+                parts.append(current.strip().rstrip(","))
+            parts.append(tags.strip().rstrip(","))
+            return ", ".join(parts)
+
+        insert_into_subject_btn.click(
+            fn=_do_insert_into_subject,
+            inputs=[extracted_tags_box, custom_subject],
+            outputs=[custom_subject],
+        )
+
+        # Intensity preset -> weight/mode dial.
+        INTENSITY_PRESETS = {
+            "Loose (creative variation)": {
+                "mode_label": "txt2img (creative — generate from prompt + CN)",
+                "denoise": None, "cfg": 6.0,
+                "canny_w": 0.50, "canny_end": 0.40,
+                "depth_w": 0.30, "depth_end": 0.30,
+                "pose_w":  0.60, "pose_end":  0.60,
+                "tile_w":  0.40, "tile_end":  0.50,
+                "ipa_w":   0.50, "ipa_end":   0.80,
+            },
+            "Balanced (closer match)": {
+                "mode_label": "txt2img (creative — generate from prompt + CN)",
+                "denoise": None, "cfg": 6.0,
+                "canny_w": 0.75, "canny_end": 0.60,
+                "depth_w": 0.55, "depth_end": 0.50,
+                "pose_w":  0.75, "pose_end":  0.75,
+                "tile_w":  0.50, "tile_end":  0.70,
+                "ipa_w":   0.75, "ipa_end":   1.00,
+            },
+            "Strict (near-1:1) - recommended": {
+                "mode_label": "img2img (1:1 — starts from your source image)",
+                "denoise": 0.55, "cfg": 5.5,
+                "canny_w": 0.90, "canny_end": 0.75,
+                "depth_w": 0.70, "depth_end": 0.65,
+                "pose_w":  0.85, "pose_end":  0.85,
+                "tile_w":  0.55, "tile_end":  0.80,
+                "ipa_w":   0.95, "ipa_end":   1.00,
+            },
+            "Maximum (almost identical)": {
+                "mode_label": "img2img (1:1 — starts from your source image)",
+                "denoise": 0.40, "cfg": 5.0,
+                "canny_w": 1.10, "canny_end": 0.90,
+                "depth_w": 0.85, "depth_end": 0.80,
+                "pose_w":  1.00, "pose_end":  0.95,
+                "tile_w":  0.70, "tile_end":  0.90,
+                "ipa_w":   1.15, "ipa_end":   1.00,
+            },
+        }
+
+        def _do_replicate_generate(
+            source_img, tags_str, add_quality,
+            ult_pos, ult_neg,
+            mode_label, denoise_val, intensity_label,
+            resolution_mode,
+            steps_, cfg_, sampler_, seed_, width_, height_,
+            canny_on, canny_w, canny_end,
+            depth_on, depth_w, depth_end,
+            pose_on,  pose_w,  pose_end,
+            tile_on,  tile_w,  tile_end,
+            ipa_on,   ipa_w,   ipa_end,
+        ):
+            # Apply the intensity preset if one is picked. Sliders/mode reflect
+            # whatever the preset wants; explicit user adjustments still get
+            # used if they tweak the sliders AFTER picking a preset (Gradio
+            # state is just what gets passed in).
+            preset = INTENSITY_PRESETS.get(intensity_label)
+            if preset:
+                mode_label   = preset["mode_label"]
+                if preset["denoise"] is not None:
+                    denoise_val = preset["denoise"]
+                cfg_      = preset["cfg"]
+                canny_w   = preset["canny_w"];   canny_end = preset["canny_end"]
+                depth_w   = preset["depth_w"];   depth_end = preset["depth_end"]
+                pose_w    = preset["pose_w"];    pose_end  = preset["pose_end"]
+                tile_w    = preset["tile_w"];    tile_end  = preset["tile_end"]
+                ipa_w     = preset["ipa_w"];     ipa_end   = preset["ipa_end"]
+
+            if source_img is None:
+                yield None, "⚠️  Upload a reference image first."
+                return
+            if not tags_str or not tags_str.strip():
+                yield None, "⚠️  Click **Analyze image** first."
+                return
+
+            # Prefer the Ultimate Prompt if available. The 2nd arg into this
+            # handler is the extracted WD14 tag string; the 3rd is the user
+            # quality toggle. We swap in the ultimate prompt when it has been
+            # populated by the analyze step (via the ultimate_prompt_box).
+            # Use Ultimate Prompt if Analyze populated it; otherwise fall back to
+            # the raw tag string + standard negative.
+            if ult_pos and ult_pos.strip():
+                full_pos = ult_pos.strip()
+                full_neg = (ult_neg or ILLUSTRIOUS_REPLICATE_NEGATIVE).strip()
+            else:
+                if add_quality:
+                    full_pos = "{}, {}".format(tags_str, ILLUSTRIOUS_REPLICATE_QUALITY)
+                    full_neg = ILLUSTRIOUS_REPLICATE_NEGATIVE
+                else:
+                    full_pos = tags_str
+                    full_neg = ""
+
+            # Build CN unit specs
+            units_spec = []
+            summary = []
+            def add(label, cat_pri, module, on, w, end, cat_fallback=None):
+                if not on: return
+                m = _cn_pick(cat_pri) or (_cn_pick(cat_fallback) if cat_fallback else "")
+                if not m:
+                    return
+                units_spec.append({"module": module, "model": m,
+                                   "weight": w, "guidance_end": end})
+                summary.append("{} ({:.2f}, end {:.2f}) - {}".format(label, w, end, m))
+
+            add("Canny",      "canny",     "canny",                 canny_on, canny_w, canny_end, "union")
+            add("Depth",      "depth",     "depth_anything_v2",     depth_on, depth_w, depth_end, "union")
+            add("OpenPose",   "openpose",  "openpose_full",         pose_on,  pose_w,  pose_end,  "union")
+            add("Tile",       "tile",      "tile_resample",         tile_on,  tile_w,  tile_end)
+            add("IP-Adapter", "ipadapter", "ip-adapter_clip_sdxl_plus_vith",
+                ipa_on, ipa_w, ipa_end)
+
+            if not units_spec:
+                yield None, ("⚠️  No matching CN models found. Untick units you "
+                             "don't have or install more SDXL CN models.")
+                return
+
+            mode_str = "img2img (denoise {:.2f})".format(denoise_val) if mode_label.startswith("img2img") else "txt2img"
+            # Pre-compute resolution so we can show it in the progress message
+            final_w_status, final_h_status = _compute_output_size(
+                resolution_mode, source_img, width_, height_)
+            res_str = "{}x{}".format(final_w_status, final_h_status)
+            if source_img is not None:
+                sw, sh = source_img.size
+                res_str += " (source was {}x{})".format(sw, sh)
+            yield None, ("Mode: **{}**  ·  intensity: **{}**  ·  output **{}**\n\n"
+                         "Building with **{}** ControlNet unit(s):\n\n- {}\n\n"
+                         "**Generating...**").format(
+                mode_str, intensity_label, res_str,
+                len(units_spec), "\n- ".join(summary))
+
+            mode = "img2img" if mode_label.startswith("img2img") else "txt2img"
+            # Resolve the final width/height from the resolution mode.
+            final_w, final_h = _compute_output_size(
+                resolution_mode, source_img, width_, height_)
+            img, info = _run_replication_generate(
+                source_img, full_pos, full_neg, units_spec,
+                steps=steps_, sampler=sampler_, cfg=cfg_,
+                width=final_w, height=final_h, seed=seed_,
+                mode=mode, denoise=denoise_val,
+            )
+            if img is None:
+                yield None, "❌ **Generation failed**: {}".format(info)
+                return
+
+            yield img, ("✅ **Replication done** with {} CN unit(s). Image "
+                        "saved to your txt2img output folder."
+                        ).format(len(units_spec))
+
+        generate_cn_btn.click(
+            fn=_do_replicate_generate,
+            inputs=[analyze_image_input, extracted_tags_box, add_quality_cb,
+                    ultimate_prompt_box, ultimate_negative_box,
+                    replicate_mode_radio, replicate_denoise, replicate_intensity,
+                    replicate_resolution_mode,
+                    cn_steps, cn_cfg, cn_sampler, cn_seed, cn_width, cn_height,
+                    cn_canny_cb,     cn_canny_weight,     cn_canny_end,
+                    cn_depth_cb,     cn_depth_weight,     cn_depth_end,
+                    cn_pose_cb,      cn_pose_weight,      cn_pose_end,
+                    cn_tile_cb,      cn_tile_weight,      cn_tile_end,
+                    cn_ipadapter_cb, cn_ipadapter_weight, cn_ipadapter_end],
+            outputs=[cn_result_image, cn_status],
+        )
+
         def _format_params(positive: str, negative: str) -> str:
             if not positive and not negative:
                 return ""
@@ -2225,6 +4078,12 @@ def _on_ui_tabs():
                 tabname="img2img",
                 source_text_component=params_state,
             ))
+            register(ParamBinding(
+                paste_button=replicate_t2i_btn,
+                tabname="txt2img",
+                source_text_component=replicate_params_state,
+            ))
+
         else:
             send_t2i_btn.click(
                 fn=lambda: "[!] Send-to-txt2img not wired. Copy manually.",
