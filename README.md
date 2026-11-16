@@ -6,6 +6,32 @@ NoobAI XL on Forge. You either pick from human-readable dropdowns (Pose:
 translate every choice into the right booru tags — or you upload a reference
 image and we reverse-engineer the tags directly.
 
+## What's new - November 2026
+
+- **The builder lives in txt2img.** The guided builder is now an accordion,
+  **✨ Prompt Enhancer — guided builder**, inside the txt2img tab, next to
+  ControlNet and ADetailer. The extra tools have their own tab,
+  **Prompt Enhancer · Pro Tools**.
+- **Pro Tools** (`lib_enhancer/`):
+  - **Prompt linter** — flags common mistakes before you spend a generation.
+  - **Token counter** — CLIP token count with the 75-token chunk boundary.
+  - **LoRA suggestions** — LoRAs from your `models/Lora` folder that match the
+    detected tags.
+  - **ControlNet suggestions** — which ControlNet unit fits the picture.
+  - **Negative-prompt presets** and **named presets** for your own settings.
+  - **Wildcards** — `{red|blue|green} dress` picks one per generation.
+  - **Recent artists** — a short quick-pick list of artists you used.
+  - **History** — this session's generations (`user_data/history.json`).
+  - **Batch analyze** — WD14 over a whole folder, saved as CSV / JSON.
+  - **Image compare** — two images' embedded settings side by side.
+  - **Recipe card** — a PNG with the prompt, a thumbnail and the key settings.
+  - **Send to ADetailer** — detected character tags into ADetailer's
+    *Detector Classes*.
+- **Install keeps ADetailer set up.** `install.py` installs missing packages
+  and re-applies two small ADetailer patches after ADetailer updates: its
+  accordion is enabled by default, and Forge Neo's
+  `mediapipe_face_mesh_eyes_only` detector name is registered.
+
 ## How to use
 
 1. Open the **Prompt Enhancer** tab in Forge.
