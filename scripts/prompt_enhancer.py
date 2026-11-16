@@ -41,8 +41,6 @@ SUBJECTS = {
     "Solo - 1boy (young adult male)":    "1boy, solo",
     "Solo - mature woman":               "1girl, solo, mature_female",
     "Solo - elderly":                    "1other, solo, old",
-    "Solo - female child":               "1girl, solo, child",
-    "Solo - male child":                 "1boy, solo, child",
     "Solo - non-human creature":         "1other, solo",
     "Pair - 2girls":                     "2girls",
     "Pair - 2boys":                      "2boys",
@@ -197,7 +195,7 @@ ACTIONS = {
     "Bowing":                         "bowing, formal",
     "Curtsy":                         "curtsy, holding_dress",
     "Pinching cheek":                 "pinching, cheek_pinching",
-    "Petting cat / dog":              "petting, cat" if 1 else "",
+    "Petting cat / dog":              "petting, animal",
     NONE:                    "",
 }
 
@@ -962,9 +960,31 @@ def _wd14_download(model_key, progress_cb=None):
 def _wd14_load(model_key, progress_cb=None):
     """Lazy-build and cache the ONNX session + parsed tag table for the
     given model key. Subsequent calls with the same key return the cached
-    session immediately."""
+    session immediately.
+
+    The cache is bounded to ONE entry (LRU=1). Switching models releases the
+    previous session — the EVA02-large model alone is ~1.3GB on CUDA, and
+    holding multiple of them concurrently can starve the SD checkpoint
+    of GPU memory on 8-12GB cards."""
     if model_key in _WD14_CACHE:
         return _WD14_CACHE[model_key]
+
+    # Evict the previous session before allocating a new one.
+    if _WD14_CACHE:
+        prev_key = next(iter(_WD14_CACHE))
+        prev_sess, _prev_rows = _WD14_CACHE.pop(prev_key)
+        try:
+            # onnxruntime InferenceSession has no public close(); drop the
+            # underlying C++ handle so the CUDA allocation is released.
+            if hasattr(prev_sess, "_sess"):
+                prev_sess._sess = None
+        except Exception:
+            pass
+        del prev_sess
+        import gc
+        gc.collect()
+        if progress_cb:
+            progress_cb("Released previous WD14 model ({})".format(prev_key.split(" ", 1)[0]))
 
     model_p, tags_p = _wd14_download(model_key, progress_cb)
 
@@ -1077,14 +1097,14 @@ def _scan_metadata_for_characters(metadata_positive, all_char_predictions):
 
 def analyze_image_wd14(pil_img, general_threshold=0.35, character_threshold=0.55,
                        artist_threshold=0.30, model_key=None, progress_cb=None):
-    if not model_key:
-        model_key = WD14_DEFAULT_MODEL_KEY
     """Return {'general':..., 'characters':..., 'artists':..., 'styles':...,
               'ratings':..., 'tag_string':str}.
     Each list is [(tag, score)] sorted by score descending.
     'styles' is a subset of 'general' filtered against WD14_STYLE_TAGS so the
     user can see "this looks like watercolor / cel-shading / etc." at a glance.
     """
+    if not model_key:
+        model_key = WD14_DEFAULT_MODEL_KEY
     sess, tags = _wd14_load(model_key, progress_cb)
     arr = _wd14_preprocess(pil_img)
     if progress_cb: progress_cb("Running inference...")
@@ -1394,19 +1414,37 @@ def _extract_image_metadata(pil_img):
         pass
     out["raw_text_chunks"] = text_chunks
 
-    # NovelAI format — check signature first (most specific).
-    # NAI sets Software="NovelAI" (and a Source line like "Stable Diffusion XL ...").
-    sw_or_src = "{} {}".format(text_chunks.get("Software", ""),
-                                text_chunks.get("Source", ""))
-    if "NovelAI" in sw_or_src:
-        parsed = _parse_novelai_metadata(text_chunks)
+    # A1111 / Forge format takes precedence over NovelAI signature detection.
+    # Rationale: if an image was re-saved in A1111/Forge after NAI generation,
+    # the "Software"/"Source" tags may still say NovelAI but the authoritative
+    # prompt + negative now live in the "parameters" chunk. Trusting NAI when
+    # an A1111 parameters block exists drops the negative prompt silently.
+    if "parameters" in text_chunks and isinstance(text_chunks["parameters"], str):
+        parsed = _parse_a1111_params(text_chunks["parameters"])
         if parsed["positive"]:
-            out["source"] = "novelai"
+            out["source"] = "a1111/forge"
             out["positive"] = parsed["positive"]
             out["negative"] = parsed["negative"]
             out["settings"] = parsed["settings"]
 
-    # A1111 / Forge format
+    # NovelAI format — only fall through to this if no A1111 parameters block
+    # was found AND the NAI Comment chunk (which holds the real settings JSON)
+    # actually parses. The Software/Source-only check was too loose.
+    if out["source"] == "none" and "Comment" in text_chunks:
+        try:
+            import json as _json
+            _json.loads(text_chunks["Comment"])  # validate
+            parsed = _parse_novelai_metadata(text_chunks)
+            if parsed["positive"]:
+                out["source"] = "novelai"
+                out["positive"] = parsed["positive"]
+                out["negative"] = parsed["negative"]
+                out["settings"] = parsed["settings"]
+        except (ValueError, TypeError):
+            pass
+
+    # A1111 / Forge format (re-check kept for backward compat with the original
+    # control flow — harmless no-op if we already populated above).
     if out["source"] == "none" and "parameters" in text_chunks and isinstance(text_chunks["parameters"], str):
         parsed = _parse_a1111_params(text_chunks["parameters"])
         if parsed["positive"]:
@@ -2249,7 +2287,6 @@ def _count_from_subject(label: str) -> int:
 ALL_FEMALE_SUBJECTS = {
     "Solo - 1girl (young adult female)",
     "Solo - mature woman",
-    "Solo - female child",
     "Pair - 2girls",
     "Trio - 3girls",
     "Group - multiple girls",
@@ -2839,6 +2876,35 @@ def _run_replication_generate(source_pil, positive, negative, units_spec,
         if not ok:
             return None, attach_err
 
+        # ---- Inject ControlNet metadata into the saved PNG's infotext block ----
+        # Without this the saved image's "parameters" chunk has no CN config,
+        # which means re-dragging it back into txt2img would NOT rebuild the
+        # CN units. Forge expects per-unit keys: "ControlNet 0", "ControlNet 1",
+        # each value being a comma-joined `key: value` string.
+        try:
+            if not hasattr(p, "extra_generation_params") or p.extra_generation_params is None:
+                p.extra_generation_params = {}
+            for i, u in enumerate(units_spec):
+                if not u.get("model"):
+                    continue
+                proc_res = int(u.get("processor_res", max(int(width), int(height), 1024)))
+                parts = [
+                    'Module: "{}"'.format(u.get("module", "none")),
+                    'Model: "{}"'.format(u["model"]),
+                    "Weight: {:.2f}".format(float(u.get("weight", 1.0))),
+                    'Resize Mode: "{}"'.format(u.get("resize_mode", "Crop and Resize")),
+                    "Low Vram: False",
+                    "Processor Res: {}".format(proc_res),
+                    "Guidance Start: {:.2f}".format(float(u.get("guidance_start", 0.0))),
+                    "Guidance End: {:.2f}".format(float(u.get("guidance_end", 1.0))),
+                    "Pixel Perfect: True",
+                    'Control Mode: "{}"'.format(u.get("control_mode", "Balanced")),
+                ]
+                p.extra_generation_params["ControlNet {}".format(i)] = ", ".join(parts)
+        except Exception:
+            # Infotext is a nice-to-have; never fail the generation if it errors.
+            pass
+
         processed = processing.process_images(p)
         if not processed or not processed.images:
             return None, "No image returned by processing."
@@ -2873,8 +2939,15 @@ def _build_controlnet_infotext(units):
     return ", ".join(out) if out else ""
 
 
-def _on_ui_tabs():
-    with gr.Blocks(analytics_enabled=False) as ui:
+def _on_ui_tabs(ctx=None):
+    """Build the Prompt Enhancer UI.
+
+    `ctx=None` → own gr.Blocks (legacy tab). `ctx=nullcontext()` → render
+    into the caller's container, which is how this now appears as an
+    accordion on txt2img instead of occupying its own page.
+    """
+    with (ctx if ctx is not None
+          else gr.Blocks(analytics_enabled=False)) as ui:
         gr.Markdown(
             "## Prompt Enhancer — guided builder\n"
             "Pick from the dropdowns below. Each option maps to the booru tags "
@@ -3540,8 +3613,9 @@ def _on_ui_tabs():
         def _apply_scenario(scenario_label):
             tmpl = SCENARIOS.get(scenario_label, {})
             if not tmpl:
+                # No template selected — don't touch the form, just hint.
                 return [gr.update()] * 11 + [
-                    "Cleared — fill the sections manually."
+                    "Pick a scenario template above first, then click Apply."
                 ]
             return [
                 gr.update(value=tmpl.get("subject", "Solo - 1girl (young adult female)")),
@@ -3687,25 +3761,9 @@ def _on_ui_tabs():
                         scene_lines.append("**{}**: {}".format(label, items))
                 scene_field = "\n".join(scene_lines) or "(no scene context detected)"
 
-                # Derive Size from the source image (snapped to nearest SDXL bucket)
-                # so the txt2img paste-button doesn't always land on 1024x1024.
-                try:
-                    _sw, _sh = img.size
-                    _pw, _ph = _snap_to_sdxl_bucket(_sw, _sh)
-                    paste_size = "{}x{}".format(_pw, _ph)
-                except Exception:
-                    paste_size = "1024x1024"
-
-                if add_quality:
-                    full_pos = "{}, {}".format(tag_str, ILLUSTRIOUS_REPLICATE_QUALITY)
-                    paste = ("{}\nNegative prompt: {}\nSteps: 28, "
-                             "Sampler: Euler a, CFG scale: 6, Size: {}"
-                             ).format(full_pos, ILLUSTRIOUS_REPLICATE_NEGATIVE,
-                                       paste_size)
-                else:
-                    full_pos = tag_str
-                    paste = ("{}\nSteps: 28, Sampler: Euler a, "
-                             "CFG scale: 6, Size: {}").format(full_pos, paste_size)
+                # NOTE: an earlier code path built a `paste` from `tag_str` here
+                # and immediately threw it away after the Ultimate Prompt block.
+                # Removed; the surviving paste is built below using ult_pos/ult_neg.
 
                 # ---- Build metadata display strings ----
                 meta_source = meta["source"]
@@ -3754,13 +3812,20 @@ def _on_ui_tabs():
                 except Exception:
                     paste_size_ult = "1024x1024"
 
+                # If the source image embedded a Model hint, preserve it so the
+                # paste-button can carry it through to txt2img/img2img.
+                _src_model = meta["settings"].get("Model", "") if meta.get("settings") else ""
+                _model_suffix = ", Model: {}".format(_src_model) if _src_model else ""
+
                 if add_quality:
                     paste = ("{}\nNegative prompt: {}\nSteps: 28, "
-                             "Sampler: Euler a, CFG scale: 6, Size: {}"
-                             ).format(ult_pos, ult_neg, paste_size_ult)
+                             "Sampler: Euler a, CFG scale: 6, Size: {}{}"
+                             ).format(ult_pos, ult_neg, paste_size_ult,
+                                      _model_suffix)
                 else:
                     paste = ("{}\nSteps: 28, Sampler: Euler a, "
-                             "CFG scale: 6, Size: {}").format(ult_pos, paste_size_ult)
+                             "CFG scale: 6, Size: {}{}").format(
+                                ult_pos, paste_size_ult, _model_suffix)
 
                 status_md = ("✅ {} model · {} metadata · "
                              "**{}** general · **{}** artist · **{}** style · "
@@ -3923,6 +3988,13 @@ def _on_ui_tabs():
                     full_pos = tags_str
                     full_neg = ""
 
+            # Resolve target resolution FIRST so we can use it as the CN
+            # processor_res default. Pre-processing at the actual output bucket
+            # (e.g. 1216x832) gives sharper edge/depth maps than the 1024 fallback.
+            final_w_status, final_h_status = _compute_output_size(
+                resolution_mode, source_img, width_, height_)
+            _cn_proc_res = max(int(final_w_status), int(final_h_status), 512)
+
             # Build CN unit specs
             units_spec = []
             summary = []
@@ -3932,7 +4004,8 @@ def _on_ui_tabs():
                 if not m:
                     return
                 units_spec.append({"module": module, "model": m,
-                                   "weight": w, "guidance_end": end})
+                                   "weight": w, "guidance_end": end,
+                                   "processor_res": _cn_proc_res})
                 summary.append("{} ({:.2f}, end {:.2f}) - {}".format(label, w, end, m))
 
             add("Canny",      "canny",     "canny",                 canny_on, canny_w, canny_end, "union")
@@ -3948,9 +4021,6 @@ def _on_ui_tabs():
                 return
 
             mode_str = "img2img (denoise {:.2f})".format(denoise_val) if mode_label.startswith("img2img") else "txt2img"
-            # Pre-compute resolution so we can show it in the progress message
-            final_w_status, final_h_status = _compute_output_size(
-                resolution_mode, source_img, width_, height_)
             res_str = "{}x{}".format(final_w_status, final_h_status)
             if source_img is not None:
                 sw, sh = source_img.size
@@ -4024,16 +4094,17 @@ def _on_ui_tabs():
                 extra_pos, extra_neg,
                 char1_traits=c1, char2_traits=c2,
                 char3_traits=c3, char4_traits=c4,
-                use_break=ub,
+                use_break=bool(ub),
                 body_label=body_l,
                 intimacy_label=intimacy_l,
                 artist_label=artist_l,
-                artist_strength=artist_s,
-                custom_artist_tag=custom_artist,
-                force_female_only=force_female,
-                yuri=yuri_on,
+                artist_strength=float(artist_s) if artist_s is not None else 1.0,
+                custom_artist_tag=custom_artist or "",
+                force_female_only=bool(force_female),
+                yuri=bool(yuri_on),
             )
-            return pos, neg, msg, _format_params(pos, neg)
+            params_str = _format_params(pos, neg)
+            return pos, neg, msg, params_str
 
         build_btn.click(
             fn=_do_build,
@@ -4044,7 +4115,8 @@ def _on_ui_tabs():
                     outfit_dd,
                     location_dd, time_dd, lighting_dd,
                     expression_dd, style_dd,
-                    quality, negative, year, source, rating,
+                    quality, negative, year,
+                    source, rating,
                     extra_positive, extra_negative,
                     char1_traits, char2_traits, char3_traits, char4_traits,
                     use_break,
@@ -4054,48 +4126,121 @@ def _on_ui_tabs():
             outputs=[positive_out, negative_out, status, params_state],
         )
 
-        # Paste-params wiring (Forge infotext API)
+        # ====================================================================
+        # Paste-params: wire the three "Send to..." buttons to Forge's paste API.
+        # Forge Neo renamed generation_parameters_copypaste -> infotext_utils;
+        # try the new name first, fall back to legacy for compatibility.
+        # ====================================================================
         _paste_mod = None
-        for mod_name in ("modules.infotext_utils",
-                         "modules.generation_parameters_copypaste"):
+        for _mod_name in ("modules.infotext_utils",
+                          "modules.generation_parameters_copypaste"):
             try:
-                import importlib
-                _paste_mod = importlib.import_module(mod_name)
+                import importlib as _importlib
+                _paste_mod = _importlib.import_module(_mod_name)
                 break
             except ImportError:
                 continue
 
         if _paste_mod is not None and hasattr(_paste_mod, "register_paste_params_button"):
-            ParamBinding = _paste_mod.ParamBinding
-            register = _paste_mod.register_paste_params_button
-            register(ParamBinding(
-                paste_button=send_t2i_btn,
-                tabname="txt2img",
-                source_text_component=params_state,
-            ))
-            register(ParamBinding(
-                paste_button=send_i2i_btn,
-                tabname="img2img",
-                source_text_component=params_state,
-            ))
-            register(ParamBinding(
-                paste_button=replicate_t2i_btn,
-                tabname="txt2img",
-                source_text_component=replicate_params_state,
-            ))
-
-        else:
-            send_t2i_btn.click(
-                fn=lambda: "[!] Send-to-txt2img not wired. Copy manually.",
-                outputs=[status],
+            # Builder tab -> txt2img / img2img use the assembled params_state
+            _paste_mod.register_paste_params_button(
+                _paste_mod.ParamBinding(
+                    paste_button=send_t2i_btn,
+                    tabname="txt2img",
+                    source_text_component=params_state,
+                )
             )
-            send_i2i_btn.click(
-                fn=lambda: "[!] Send-to-img2img not wired. Copy manually.",
-                outputs=[status],
+            _paste_mod.register_paste_params_button(
+                _paste_mod.ParamBinding(
+                    paste_button=send_i2i_btn,
+                    tabname="img2img",
+                    source_text_component=params_state,
+                )
+            )
+            # Replicate tab -> txt2img uses the replicate_params_state populated
+            # by the image analyzer.
+            _paste_mod.register_paste_params_button(
+                _paste_mod.ParamBinding(
+                    paste_button=replicate_t2i_btn,
+                    tabname="txt2img",
+                    source_text_component=replicate_params_state,
+                    source_image_component=analyze_image_input,
+                )
             )
 
-    return [(ui, "Prompt Enhancer", "prompt_enhancer")]
+    # ========================================================================
+    # Pro Tools tab: token counter, linter, negative presets, prompt presets,
+    # wildcards, LoRA suggest, CN recipe presets, auto-CN suggest, batch
+    # analyzer, image compare, send-to-ADetailer, recipe card, history,
+    # recent artists. Built in a separate Blocks under lib_enhancer/ui_panel.
+    # If the import fails we silently skip — the main tab still works.
+    # ========================================================================
+    # accordion mode: the builder above already rendered into txt2img,
+    # and Pro Tools keeps its own page, so stop here.
+    if ctx is not None:
+        return []
+
+    pro_entry = None
+    try:
+        import sys as _sys, os as _os
+        _ext_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        if _ext_root not in _sys.path:
+            _sys.path.insert(0, _ext_root)
+        from lib_enhancer.ui_panel import build_pro_tools_blocks
+        pro_entry = (build_pro_tools_blocks(),
+                     "Prompt Enhancer · Pro Tools",
+                     "prompt_enhancer_pro")
+    except Exception as _e:
+        print("[sd-forge-prompt-enhancer] Pro Tools tab unavailable:", _e)
+
+    tabs = [(ui, "Prompt Enhancer", "prompt_enhancer")]
+    if pro_entry is not None:
+        tabs.append(pro_entry)
+    return tabs
 
 
-if script_callbacks is not None:
-    script_callbacks.on_ui_tabs(_on_ui_tabs)
+def _pro_tools_tab():
+    """Pro Tools keeps its own page; the main builder moved to txt2img."""
+    try:
+        import sys as _sys, os as _os
+        _ext_root = _os.path.dirname(
+            _os.path.dirname(_os.path.abspath(__file__)))
+        if _ext_root not in _sys.path:
+            _sys.path.insert(0, _ext_root)
+        from lib_enhancer.ui_panel import build_pro_tools_blocks
+        return [(build_pro_tools_blocks(),
+                 "Prompt Enhancer · Pro Tools", "prompt_enhancer_pro")]
+    except Exception as _e:
+        print("[sd-forge-prompt-enhancer] Pro Tools tab unavailable:", _e)
+        return []
+
+
+script_callbacks.on_ui_tabs(_pro_tools_tab)
+
+
+# ── the guided builder now lives ON txt2img ───────────────────────────
+try:
+    from modules import scripts as _scripts
+except ImportError:                                   # pragma: no cover
+    _scripts = None
+
+if _scripts is not None:
+    class PromptEnhancerAccordion(_scripts.Script):
+        def title(self):
+            return "Prompt Enhancer"
+
+        def show(self, is_img2img):
+            return _scripts.AlwaysVisible
+
+        def ui(self, is_img2img):
+            if is_img2img:
+                return []
+            import contextlib
+            try:
+                with gr.Accordion("✨ Prompt Enhancer — guided builder",
+                                  open=False,
+                                  elem_id="enhancer_accordion"):
+                    _on_ui_tabs(contextlib.nullcontext())
+            except Exception as exc:
+                print("[sd-forge-prompt-enhancer] accordion failed:", exc)
+            return []
